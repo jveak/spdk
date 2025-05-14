@@ -6,8 +6,9 @@
 #ifndef SPDK_BDEV_DUALTIER_H
 #define SPDK_BDEV_DUALTIER_H
 
-#include "spdk/bdev_module.h"
-#include "spdk/uuid.h"
+#include <spdk/stdinc.h>
+#include <spdk/bdev_module.h>
+#include <spdk/uuid.h>
 
 /* DualTier bdev的状态 */
 enum dualtier_bdev_state {
@@ -33,8 +34,8 @@ struct dualtier_bdev_config {
 /* DualTier bdev的主要数据结构 */
 struct dualtier_bdev {
     struct dualtier_bdev_config config;     /* 配置信息 */
-    struct spdk_bdev_desc *fast_desc;       /* 高速bdev的描述符 */
-    struct spdk_bdev_desc *slow_desc;       /* 低速bdev的描述符 */
+    struct spdk_bdev_desc *fast_desc;       /* 快速层描述符 */
+    struct spdk_bdev_desc *slow_desc;       /* 慢速层描述符 */
     struct spdk_bdev bdev;                  /* 基础bdev结构 */
     TAILQ_ENTRY(dualtier_bdev) link;       /* 链表项 */
 };
@@ -65,5 +66,12 @@ int dualtier_bdev_create(const char *name, const char *fast_bdev,
 
 /* 删除DualTier bdev */
 int dualtier_bdev_delete(const char *name);
+
+/* bdev销毁函数 */
+int dualtier_bdev_destruct(void *ctx);
+
+/* 确保IO结构大小合适 */
+static_assert(sizeof(struct dualtier_bdev_io) <= SPDK_BDEV_IO_GET_AUX_BUF_SIZE,
+              "dualtier_bdev_io size is too large");
 
 #endif /* SPDK_BDEV_DUALTIER_H */ 

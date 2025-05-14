@@ -3,11 +3,12 @@
  *   All rights reserved.
  */
 
+#include <spdk/stdinc.h>
 #include "bdev_dualtier.h"
-#include "spdk/rpc.h"
-#include "spdk/util.h"
-#include "spdk/string.h"
-#include "spdk/log.h"
+#include <spdk/rpc.h>
+#include <spdk/util.h>
+#include <spdk/string.h>
+#include <spdk/log.h>
 
 /* RPC命令参数结构 */
 struct rpc_create_dualtier {
@@ -25,6 +26,9 @@ struct rpc_delete_dualtier {
 static void
 free_rpc_create_dualtier(struct rpc_create_dualtier *req)
 {
+    if (!req) {
+        return;
+    }
     free(req->name);
     free(req->fast_bdev);
     free(req->slow_bdev);
@@ -34,6 +38,9 @@ free_rpc_create_dualtier(struct rpc_create_dualtier *req)
 static void
 free_rpc_delete_dualtier(struct rpc_delete_dualtier *req)
 {
+    if (!req) {
+        return;
+    }
     free(req->name);
 }
 
@@ -58,6 +65,11 @@ rpc_bdev_dualtier_create(struct spdk_jsonrpc_request *request,
     struct spdk_json_write_ctx *w;
     int rc;
 
+    if (!request || !params) {
+        SPDK_ERRLOG("Invalid RPC parameters\n");
+        return;
+    }
+
     if (spdk_json_decode_object(params, rpc_create_dualtier_decoders,
                                SPDK_COUNTOF(rpc_create_dualtier_decoders),
                                &req)) {
@@ -69,11 +81,16 @@ rpc_bdev_dualtier_create(struct spdk_jsonrpc_request *request,
 
     rc = dualtier_bdev_create(req.name, req.fast_bdev, req.slow_bdev);
     if (rc != 0) {
+        SPDK_ERRLOG("Failed to create dualtier bdev: %s\n", spdk_strerror(-rc));
         spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
         goto cleanup;
     }
 
     w = spdk_jsonrpc_begin_result(request);
+    if (!w) {
+        SPDK_ERRLOG("Failed to begin JSON response\n");
+        goto cleanup;
+    }
     spdk_json_write_string(w, req.name);
     spdk_jsonrpc_end_result(request, w);
 
@@ -90,6 +107,11 @@ rpc_bdev_dualtier_delete(struct spdk_jsonrpc_request *request,
     struct spdk_json_write_ctx *w;
     int rc;
 
+    if (!request || !params) {
+        SPDK_ERRLOG("Invalid RPC parameters\n");
+        return;
+    }
+
     if (spdk_json_decode_object(params, rpc_delete_dualtier_decoders,
                                SPDK_COUNTOF(rpc_delete_dualtier_decoders),
                                &req)) {
@@ -101,11 +123,16 @@ rpc_bdev_dualtier_delete(struct spdk_jsonrpc_request *request,
 
     rc = dualtier_bdev_delete(req.name);
     if (rc != 0) {
+        SPDK_ERRLOG("Failed to delete dualtier bdev: %s\n", spdk_strerror(-rc));
         spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
         goto cleanup;
     }
 
     w = spdk_jsonrpc_begin_result(request);
+    if (!w) {
+        SPDK_ERRLOG("Failed to begin JSON response\n");
+        goto cleanup;
+    }
     spdk_json_write_bool(w, true);
     spdk_jsonrpc_end_result(request, w);
 

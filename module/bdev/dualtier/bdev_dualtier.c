@@ -3,11 +3,12 @@
  *   All rights reserved.
  */
 
+#include <spdk/stdinc.h>
 #include "bdev_dualtier.h"
-#include "spdk/rpc.h"
-#include "spdk/util.h"
-#include "spdk/string.h"
-#include "spdk/log.h"
+#include <spdk/rpc.h>
+#include <spdk/util.h>
+#include <spdk/string.h>
+#include <spdk/log.h>
 
 /* DualTier bdev列表 */
 static TAILQ_HEAD(, dualtier_bdev) g_dualtier_bdev_list = TAILQ_HEAD_INITIALIZER(g_dualtier_bdev_list);
@@ -27,8 +28,14 @@ static void
 dualtier_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
     struct dualtier_bdev_io *dualtier_io = cb_arg;
-    struct spdk_bdev_io *parent_io = dualtier_io->bdev_io;
+    struct spdk_bdev_io *parent_io;
 
+    if (!dualtier_io) {
+        SPDK_ERRLOG("Invalid dualtier_io\n");
+        return;
+    }
+
+    parent_io = dualtier_io->bdev_io;
     spdk_bdev_free_io(bdev_io);
     spdk_bdev_io_complete(parent_io, success);
     free(dualtier_io);
@@ -38,13 +45,29 @@ dualtier_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_a
 static void
 dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-    struct dualtier_bdev_channel *dualtier_ch = spdk_io_channel_get_ctx(ch);
-    struct dualtier_bdev *dualtier_bdev = bdev_io->bdev->ctxt;
+    struct dualtier_bdev_channel *dualtier_ch;
+    struct dualtier_bdev *dualtier_bdev;
     struct dualtier_bdev_io *dualtier_io;
     int rc = 0;
 
+    if (!ch || !bdev_io) {
+        SPDK_ERRLOG("Invalid parameters\n");
+        spdk_bdev_io_complete(bdev_io, false);
+        return;
+    }
+
+    dualtier_ch = spdk_io_channel_get_ctx(ch);
+    dualtier_bdev = bdev_io->bdev->ctxt;
+
+    if (!dualtier_ch || !dualtier_bdev) {
+        SPDK_ERRLOG("Invalid channel or bdev context\n");
+        spdk_bdev_io_complete(bdev_io, false);
+        return;
+    }
+
     dualtier_io = calloc(1, sizeof(*dualtier_io));
     if (!dualtier_io) {
+        SPDK_ERRLOG("Failed to allocate dualtier_io\n");
         spdk_bdev_io_complete(bdev_io, false);
         return;
     }
@@ -52,12 +75,19 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
     dualtier_io->dualtier_bdev = dualtier_bdev;
     dualtier_io->bdev_io = bdev_io;
 
-    /* 根据IO类型和目标层级选择合适的bdev和channel */
-    struct spdk_bdev_desc *desc;
-    struct spdk_io_channel *io_ch;
-    
+    /* 检查IO控制信息 */
+    if (!bdev_io->u.bdev.ext_opts || !bdev_io->u.bdev.ext_opts->metadata) {
+        SPDK_ERRLOG("Missing IO control information\n");
+        free(dualtier_io);
+        spdk_bdev_io_complete(bdev_io, false);
+        return;
+    }
+
     /* 从IO控制信息中获取目标层级 */
     dualtier_io->tier = (enum dualtier_tier_type)bdev_io->u.bdev.ext_opts->metadata;
+    
+    struct spdk_bdev_desc *desc;
+    struct spdk_io_channel *io_ch;
     
     if (dualtier_io->tier == DUALTIER_TIER_FAST) {
         desc = dualtier_bdev->fast_desc;
@@ -65,6 +95,13 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
     } else {
         desc = dualtier_bdev->slow_desc;
         io_ch = dualtier_ch->slow_ch;
+    }
+
+    if (!desc || !io_ch) {
+        SPDK_ERRLOG("Invalid descriptor or channel for tier %d\n", dualtier_io->tier);
+        free(dualtier_io);
+        spdk_bdev_io_complete(bdev_io, false);
+        return;
     }
 
     switch (bdev_io->type) {
@@ -87,10 +124,12 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
                                   dualtier_io);
         break;
     default:
+        SPDK_ERRLOG("Unsupported IO type %d\n", bdev_io->type);
         rc = -ENOTSUP;
     }
 
     if (rc != 0) {
+        SPDK_ERRLOG("Failed to submit IO request: %s\n", spdk_strerror(-rc));
         free(dualtier_io);
         spdk_bdev_io_complete(bdev_io, false);
     }
@@ -101,6 +140,9 @@ static struct spdk_io_channel *
 dualtier_bdev_get_io_channel(void *ctx)
 {
     struct dualtier_bdev *dualtier_bdev = ctx;
+    if (!dualtier_bdev) {
+        return NULL;
+    }
     return spdk_get_io_channel(dualtier_bdev);
 }
 
@@ -111,15 +153,21 @@ dualtier_bdev_create_cb(void *io_device, void *ctx_buf)
     struct dualtier_bdev *dualtier_bdev = io_device;
     struct dualtier_bdev_channel *dualtier_ch = ctx_buf;
 
+    if (!dualtier_bdev || !dualtier_ch) {
+        return -EINVAL;
+    }
+
     dualtier_ch->fast_ch = spdk_bdev_get_io_channel(dualtier_bdev->fast_desc);
     if (!dualtier_ch->fast_ch) {
-        return -1;
+        SPDK_ERRLOG("Failed to get fast tier IO channel\n");
+        return -ENOMEM;
     }
 
     dualtier_ch->slow_ch = spdk_bdev_get_io_channel(dualtier_bdev->slow_desc);
     if (!dualtier_ch->slow_ch) {
+        SPDK_ERRLOG("Failed to get slow tier IO channel\n");
         spdk_put_io_channel(dualtier_ch->fast_ch);
-        return -1;
+        return -ENOMEM;
     }
 
     return 0;
@@ -131,8 +179,16 @@ dualtier_bdev_destroy_cb(void *io_device, void *ctx_buf)
 {
     struct dualtier_bdev_channel *dualtier_ch = ctx_buf;
 
-    spdk_put_io_channel(dualtier_ch->fast_ch);
-    spdk_put_io_channel(dualtier_ch->slow_ch);
+    if (!dualtier_ch) {
+        return;
+    }
+
+    if (dualtier_ch->fast_ch) {
+        spdk_put_io_channel(dualtier_ch->fast_ch);
+    }
+    if (dualtier_ch->slow_ch) {
+        spdk_put_io_channel(dualtier_ch->slow_ch);
+    }
 }
 
 /* bdev操作函数表 */
@@ -149,8 +205,14 @@ dualtier_bdev_create(const char *name, const char *fast_bdev, const char *slow_b
     struct dualtier_bdev *dualtier_bdev;
     int rc;
 
+    if (!name || !fast_bdev || !slow_bdev) {
+        SPDK_ERRLOG("Invalid parameters\n");
+        return -EINVAL;
+    }
+
     dualtier_bdev = calloc(1, sizeof(*dualtier_bdev));
     if (!dualtier_bdev) {
+        SPDK_ERRLOG("Failed to allocate dualtier_bdev\n");
         return -ENOMEM;
     }
 
@@ -158,20 +220,24 @@ dualtier_bdev_create(const char *name, const char *fast_bdev, const char *slow_b
     dualtier_bdev->config.name = strdup(name);
     dualtier_bdev->config.fast_bdev = strdup(fast_bdev);
     dualtier_bdev->config.slow_bdev = strdup(slow_bdev);
+    
     if (!dualtier_bdev->config.name || !dualtier_bdev->config.fast_bdev || 
         !dualtier_bdev->config.slow_bdev) {
         rc = -ENOMEM;
+        SPDK_ERRLOG("Failed to allocate config strings\n");
         goto error_alloc;
     }
 
     /* 打开基础bdev */
     rc = spdk_bdev_open_ext(fast_bdev, true, NULL, NULL, &dualtier_bdev->fast_desc);
     if (rc) {
+        SPDK_ERRLOG("Failed to open fast bdev %s: %s\n", fast_bdev, spdk_strerror(-rc));
         goto error_open_fast;
     }
 
     rc = spdk_bdev_open_ext(slow_bdev, true, NULL, NULL, &dualtier_bdev->slow_desc);
     if (rc) {
+        SPDK_ERRLOG("Failed to open slow bdev %s: %s\n", slow_bdev, spdk_strerror(-rc));
         goto error_open_slow;
     }
 
@@ -192,6 +258,7 @@ dualtier_bdev_create(const char *name, const char *fast_bdev, const char *slow_b
     /* 注册bdev */
     rc = spdk_bdev_register(&dualtier_bdev->bdev);
     if (rc) {
+        SPDK_ERRLOG("Failed to register bdev: %s\n", spdk_strerror(-rc));
         goto error_register;
     }
 
@@ -204,6 +271,7 @@ dualtier_bdev_create(const char *name, const char *fast_bdev, const char *slow_b
     /* 添加到列表 */
     TAILQ_INSERT_TAIL(&g_dualtier_bdev_list, dualtier_bdev, link);
 
+    SPDK_NOTICELOG("Created DualTier bdev %s\n", name);
     return 0;
 
 error_register:
@@ -225,6 +293,10 @@ dualtier_bdev_delete(const char *name)
 {
     struct dualtier_bdev *dualtier_bdev;
 
+    if (!name) {
+        return -EINVAL;
+    }
+
     TAILQ_FOREACH(dualtier_bdev, &g_dualtier_bdev_list, link) {
         if (strcmp(dualtier_bdev->config.name, name) == 0) {
             spdk_bdev_unregister(&dualtier_bdev->bdev, NULL, NULL);
@@ -236,15 +308,25 @@ dualtier_bdev_delete(const char *name)
 }
 
 /* 销毁DualTier bdev */
-static int
+int
 dualtier_bdev_destruct(void *ctx)
 {
     struct dualtier_bdev *dualtier_bdev = ctx;
 
+    if (!dualtier_bdev) {
+        return -EINVAL;
+    }
+
     TAILQ_REMOVE(&g_dualtier_bdev_list, dualtier_bdev, link);
     spdk_io_device_unregister(dualtier_bdev, NULL);
-    spdk_bdev_close(dualtier_bdev->fast_desc);
-    spdk_bdev_close(dualtier_bdev->slow_desc);
+    
+    if (dualtier_bdev->fast_desc) {
+        spdk_bdev_close(dualtier_bdev->fast_desc);
+    }
+    if (dualtier_bdev->slow_desc) {
+        spdk_bdev_close(dualtier_bdev->slow_desc);
+    }
+    
     free(dualtier_bdev->config.name);
     free(dualtier_bdev->config.fast_bdev);
     free(dualtier_bdev->config.slow_bdev);
