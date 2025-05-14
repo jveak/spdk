@@ -7,6 +7,18 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
+DIRS-y += aio crypto error gpt lvol malloc null nvme passthru raid split virtual dualtier
+
+.PHONY: all clean $(DIRS-y)
+
+all: $(DIRS-y)
+	@:
+
+clean: $(DIRS-y)
+	@:
+
+include $(SPDK_ROOT_DIR)/mk/spdk.subdirs.mk
+
 SO_VER := 17
 SO_MINOR := 0
 
