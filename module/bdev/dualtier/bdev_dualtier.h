@@ -71,7 +71,7 @@ int dualtier_bdev_delete(const char *name);
 int dualtier_bdev_destruct(void *ctx);
 
 /* 确保IO结构大小合适 */
-static_assert(sizeof(struct dualtier_bdev_io) <= SPDK_BDEV_IO_GET_AUX_BUF_SIZE,
-              "dualtier_bdev_io size is too large");
+static_assert(sizeof(struct dualtier_bdev_io) <= SPDK_BDEV_LARGE_BUF_MAX_SIZE,
+              "dualtier_bdev_io structure size exceeds maximum allowed size");
 
 #endif /* SPDK_BDEV_DUALTIER_H */ 

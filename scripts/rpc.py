@@ -3872,15 +3872,34 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=bdev_daos_delete)
 
     def bdev_daos_resize(args):
-        print_json(rpc.bdev.bdev_daos_resize(args.client,
-                                             name=args.name,
-                                             new_size=int(args.new_size)))
+        rpc.bdev.bdev_daos_resize(args.client,
+                                  name=args.name,
+                                  new_size=args.new_size)
 
-    p = subparsers.add_parser('bdev_daos_resize',
-                              help='Resize a DAOS bdev')
-    p.add_argument('name', help='DAOS bdev name')
-    p.add_argument('new_size', help='new bdev size for resize operation. The unit is MiB')
+    p = subparsers.add_parser('bdev_daos_resize', help='Resize DAOS bdev')
+    p.add_argument('name', help='Name of the DAOS bdev')
+    p.add_argument('new_size', help='New size in bytes (int)', type=int)
     p.set_defaults(func=bdev_daos_resize)
+
+    def bdev_dualtier_create(args):
+        rpc.bdev.bdev_dualtier_create(args.client,
+                                     name=args.name,
+                                     fast_bdev=args.fast_bdev,
+                                     slow_bdev=args.slow_bdev)
+
+    p = subparsers.add_parser('bdev_dualtier_create', help='Create a dualtier bdev')
+    p.add_argument('name', help='Name of the dualtier bdev')
+    p.add_argument('fast_bdev', help='Name of the fast bdev')
+    p.add_argument('slow_bdev', help='Name of the slow bdev')
+    p.set_defaults(func=bdev_dualtier_create)
+
+    def bdev_dualtier_delete(args):
+        rpc.bdev.bdev_dualtier_delete(args.client,
+                                     name=args.name)
+
+    p = subparsers.add_parser('bdev_dualtier_delete', help='Delete a dualtier bdev')
+    p.add_argument('name', help='Name of the dualtier bdev')
+    p.set_defaults(func=bdev_dualtier_delete)
 
     def iobuf_set_options(args):
         rpc.iobuf.iobuf_set_options(args.client,

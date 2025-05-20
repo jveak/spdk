@@ -41,6 +41,23 @@ dualtier_bdev_io_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_a
     free(dualtier_io);
 }
 
+/* 创建扩展IO选项 */
+static struct spdk_bdev_ext_io_opts *
+dualtier_create_ext_io_opts(enum dualtier_tier_type tier)
+{
+    struct spdk_bdev_ext_io_opts *opts;
+    
+    opts = calloc(1, sizeof(*opts));
+    if (!opts) {
+        return NULL;
+    }
+    
+    opts->size = sizeof(*opts);
+    opts->memory_domain_ctx = (void *)(uintptr_t)tier;
+    
+    return opts;
+}
+
 /* 提交IO请求 */
 static void
 dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
@@ -48,6 +65,7 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
     struct dualtier_bdev_channel *dualtier_ch;
     struct dualtier_bdev *dualtier_bdev;
     struct dualtier_bdev_io *dualtier_io;
+    struct spdk_bdev_ext_io_opts *opts;
     int rc = 0;
 
     if (!ch || !bdev_io) {
@@ -76,7 +94,7 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
     dualtier_io->bdev_io = bdev_io;
 
     /* 检查IO控制信息 */
-    if (!bdev_io->u.bdev.ext_opts || !bdev_io->u.bdev.ext_opts->metadata) {
+    if (!bdev_io->u.bdev.memory_domain_ctx) {
         SPDK_ERRLOG("Missing IO control information\n");
         free(dualtier_io);
         spdk_bdev_io_complete(bdev_io, false);
@@ -84,7 +102,7 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
     }
 
     /* 从IO控制信息中获取目标层级 */
-    dualtier_io->tier = (enum dualtier_tier_type)bdev_io->u.bdev.ext_opts->metadata;
+    dualtier_io->tier = (enum dualtier_tier_type)bdev_io->u.bdev.memory_domain_ctx;
     
     struct spdk_bdev_desc *desc;
     struct spdk_io_channel *io_ch;
@@ -104,24 +122,35 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
         return;
     }
 
+    /* 创建扩展IO选项 */
+    opts = dualtier_create_ext_io_opts(dualtier_io->tier);
+    if (!opts) {
+        SPDK_ERRLOG("Failed to create ext IO opts\n");
+        free(dualtier_io);
+        spdk_bdev_io_complete(bdev_io, false);
+        return;
+    }
+
     switch (bdev_io->type) {
     case SPDK_BDEV_IO_TYPE_READ:
-        rc = spdk_bdev_read_blocks(desc, io_ch,
-                                 bdev_io->u.bdev.iovs,
-                                 bdev_io->u.bdev.iovcnt,
-                                 bdev_io->u.bdev.offset_blocks,
-                                 bdev_io->u.bdev.num_blocks,
-                                 dualtier_bdev_io_complete,
-                                 dualtier_io);
+        rc = spdk_bdev_readv_blocks_ext(desc, io_ch,
+                                      bdev_io->u.bdev.iovs,
+                                      bdev_io->u.bdev.iovcnt,
+                                      bdev_io->u.bdev.offset_blocks,
+                                      bdev_io->u.bdev.num_blocks,
+                                      dualtier_bdev_io_complete,
+                                      dualtier_io,
+                                      opts);
         break;
     case SPDK_BDEV_IO_TYPE_WRITE:
-        rc = spdk_bdev_write_blocks(desc, io_ch,
-                                  bdev_io->u.bdev.iovs,
-                                  bdev_io->u.bdev.iovcnt,
-                                  bdev_io->u.bdev.offset_blocks,
-                                  bdev_io->u.bdev.num_blocks,
-                                  dualtier_bdev_io_complete,
-                                  dualtier_io);
+        rc = spdk_bdev_writev_blocks_ext(desc, io_ch,
+                                       bdev_io->u.bdev.iovs,
+                                       bdev_io->u.bdev.iovcnt,
+                                       bdev_io->u.bdev.offset_blocks,
+                                       bdev_io->u.bdev.num_blocks,
+                                       dualtier_bdev_io_complete,
+                                       dualtier_io,
+                                       opts);
         break;
     default:
         SPDK_ERRLOG("Unsupported IO type %d\n", bdev_io->type);
@@ -130,6 +159,7 @@ dualtier_bdev_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bd
 
     if (rc != 0) {
         SPDK_ERRLOG("Failed to submit IO request: %s\n", spdk_strerror(-rc));
+        free(opts);
         free(dualtier_io);
         spdk_bdev_io_complete(bdev_io, false);
     }
