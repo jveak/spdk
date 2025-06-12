@@ -726,7 +726,12 @@ raid5f_submit_partial_write_request(struct raid_bdev_io *raid_io, uint64_t strip
                                                     r5f_info->buf_alignment, NULL);
     if (!stripe_req->rmw_old_parity_buf) {
         SPDK_ERRLOG("Failed to allocate rmw_old_parity_buf\n");
-        for (i = 0; i < num_data_chunks; ++i) spdk_dma_free(stripe_req->rmw_old_data_bufs[i]);
+        /* Free each old data buffer and then the array */
+        for (i = 0; i < num_data_chunks; ++i) {
+            if (stripe_req->rmw_old_data_bufs[i]) {
+                spdk_dma_free(stripe_req->rmw_old_data_bufs[i]);
+            }
+        }
         free(stripe_req->rmw_old_data_bufs);
         stripe_req->rmw_old_data_bufs = NULL;
         raid5f_stripe_request_release(stripe_req);
@@ -911,7 +916,32 @@ raid5f_rmw_prepare_data_and_calculate_new_parity(struct stripe_request *stripe_r
     stripe_req->rmw_new_parity_buf = spdk_dma_malloc(chunk_size_bytes, r5f_info->buf_alignment, NULL);
     if (!stripe_req->rmw_new_parity_buf) {
         SPDK_ERRLOG("Stripe %lu: Failed to allocate rmw_new_parity_buf\n", stripe_req->stripe_index);
-        goto err_cleanup_new_data_bufs; /* Slightly different cleanup */
+        /* Clean up new data buffers */
+        if (stripe_req->rmw_new_data_bufs_for_xor) {
+            for (int i = 0; i < num_data_chunks; ++i) {
+                if (stripe_req->rmw_new_data_bufs_for_xor[i]) spdk_dma_free(stripe_req->rmw_new_data_bufs_for_xor[i]);
+            }
+            free(stripe_req->rmw_new_data_bufs_for_xor);
+            stripe_req->rmw_new_data_bufs_for_xor = NULL;
+        }
+        /* Clean up old data buffers and array */
+        if (stripe_req->rmw_old_data_bufs) {
+            for (int i = 0; i < stripe_req->rmw_data_chunks_to_read_total; ++i) {
+                if (stripe_req->rmw_old_data_bufs[i]) {
+                    spdk_dma_free(stripe_req->rmw_old_data_bufs[i]);
+                }
+            }
+            free(stripe_req->rmw_old_data_bufs);
+            stripe_req->rmw_old_data_bufs = NULL;
+        }
+        /* Clean up old parity buffer */
+        if (stripe_req->rmw_old_parity_buf) {
+            spdk_dma_free(stripe_req->rmw_old_parity_buf);
+            stripe_req->rmw_old_parity_buf = NULL;
+        }
+        raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+        raid5f_stripe_request_release(stripe_req);
+        return;
     }
 
     /* Overlay user's new data onto rmw_new_data_bufs_for_xor */
@@ -1227,20 +1257,78 @@ raid5f_initiate_rmw_write_new_data(struct stripe_request *stripe_req)
     }
 }
 
+static void raid5f_rmw_write_parity_chunk_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
+
 static void
 raid5f_initiate_rmw_write_new_parity(struct stripe_request *stripe_req)
 {
-    SPDK_NOTICELOG(bdev_raid5f, "Stripe %lu: In raid5f_initiate_rmw_write_new_parity (Not Implemented Yet).\n", stripe_req->stripe_index);
-    /* TODO: Implement writing of new parity from stripe_req->rmw_new_parity_buf */
-    /* For now, to test data writes, let's complete successfully if we reach here. */
-    /* THIS IS TEMPORARY */
     struct raid_bdev_io *raid_io = stripe_req->raid_io;
+    struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+    struct raid_base_bdev_info *base_info;
+    struct spdk_io_channel *base_ch;
+    uint64_t base_offset_blocks;
+    struct spdk_bdev_ext_io_opts io_opts;
+    struct iovec write_iov;
+    int ret;
+
+    SPDK_DEBUGLOG(bdev_raid5f, "Stripe %lu: Initiating RMW: Writing new parity chunk.\n", stripe_req->stripe_index);
+
+    struct chunk *parity_chunk = stripe_req->parity_chunk;
+    base_info = &raid_bdev->base_bdev_info[parity_chunk->index];
+    base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, parity_chunk->index);
+    base_offset_blocks = stripe_req->stripe_index << raid_bdev->strip_size_shift;
+
+    write_iov.iov_base = stripe_req->rmw_new_parity_buf;
+    write_iov.iov_len = raid_bdev->strip_size * raid_bdev->bdev.blocklen;
+
+    raid5f_init_ext_io_opts(&io_opts, raid_io);
+    io_opts.metadata = NULL; /* No metadata for internal parity write */
+
+    if (base_ch == NULL) {
+        SPDK_ERRLOG("Stripe %lu: Parity chunk device %u offline during RMW new parity write. Aborting.\n",
+                    stripe_req->stripe_index, parity_chunk->index);
+        raid5f_rmw_write_parity_chunk_done(NULL, false, stripe_req);
+        return;
+    }
+
+    stripe_req->rmw_state = RMW_WRITING_NEW_PARITY;
+    raid_io->base_bdev_io_submitted = 0;
+    raid_io->base_bdev_io_remaining = 1; /* Only one parity write */
+
+    ret = raid_bdev_writev_blocks_ext(base_info, base_ch, &write_iov, 1,
+                                      base_offset_blocks, raid_bdev->strip_size,
+                                      raid5f_rmw_write_parity_chunk_done, stripe_req, &io_opts);
+
+    if (spdk_likely(ret == 0)) {
+        raid_io->base_bdev_io_submitted++;
+    } else {
+        SPDK_ERRLOG("Stripe %lu: Error %d submitting RMW new parity write. Aborting.\n",
+                    stripe_req->stripe_index, ret);
+        raid5f_rmw_write_parity_chunk_done(NULL, false, stripe_req);
+    }
+}
+
+static void
+raid5f_rmw_write_parity_chunk_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+    struct stripe_request *stripe_req = cb_arg;
+    struct raid_bdev_io *raid_io = stripe_req->raid_io;
+
+    if (bdev_io) {
+        spdk_bdev_free_io(bdev_io);
+    }
+
+    /* Clean up new parity buffer */
     if (stripe_req->rmw_new_parity_buf) {
         spdk_dma_free(stripe_req->rmw_new_parity_buf);
         stripe_req->rmw_new_parity_buf = NULL;
     }
-    raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
-    raid5f_stripe_request_release(stripe_req);
+
+    if (raid_bdev_io_complete_part(raid_io, 1, success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED)) {
+        SPDK_DEBUGLOG(bdev_raid5f, "Stripe %lu: RMW completed with status %d\n",
+                      stripe_req->stripe_index, raid_io->status);
+        raid5f_stripe_request_release(stripe_req);
+    }
 }
 
 static void
