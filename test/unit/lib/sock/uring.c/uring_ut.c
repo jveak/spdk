@@ -31,6 +31,11 @@ DEFINE_STUB(spdk_sock_group_provide_buf, int, (struct spdk_sock_group *group, vo
 		size_t len, void *ctx), 0);
 DEFINE_STUB(spdk_sock_group_get_buf, size_t, (struct spdk_sock_group *group, void **buf,
 		void **ctx), 0);
+DEFINE_STUB(spdk_sock_posix_fd_create, int, (struct addrinfo *res, struct spdk_sock_opts *opts,
+		struct spdk_sock_impl_opts *impl_opts), 0);
+DEFINE_STUB(spdk_sock_posix_fd_connect, int, (int fd, struct addrinfo *res,
+		struct spdk_sock_opts *opts), 0);
+DEFINE_STUB(spdk_sock_posix_getaddrinfo, struct addrinfo *, (const char *ip, int port), 0);
 
 static void
 _req_cb(void *cb_arg, int len)
@@ -82,7 +87,7 @@ flush_client(void)
 	MOCK_SET(sendmsg, 192);
 	cb_arg1 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 192);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == true);
 	CU_ASSERT(TAILQ_EMPTY(&sock->queued_reqs));
 
@@ -93,7 +98,7 @@ flush_client(void)
 	cb_arg1 = false;
 	cb_arg2 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 256);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == true);
 	CU_ASSERT(cb_arg2 == true);
 	CU_ASSERT(TAILQ_EMPTY(&sock->queued_reqs));
@@ -105,7 +110,7 @@ flush_client(void)
 	cb_arg1 = false;
 	cb_arg2 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 192);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == true);
 	CU_ASSERT(cb_arg2 == false);
 	CU_ASSERT(TAILQ_FIRST(&sock->queued_reqs) == req2);
@@ -117,7 +122,7 @@ flush_client(void)
 	MOCK_SET(sendmsg, 10);
 	cb_arg1 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 10);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == false);
 	CU_ASSERT(TAILQ_FIRST(&sock->queued_reqs) == req1);
 
@@ -125,7 +130,7 @@ flush_client(void)
 	MOCK_SET(sendmsg, 52);
 	cb_arg1 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 52);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == false);
 	CU_ASSERT(TAILQ_FIRST(&sock->queued_reqs) == req1);
 
@@ -133,7 +138,7 @@ flush_client(void)
 	MOCK_SET(sendmsg, 130);
 	cb_arg1 = false;
 	rc = uring_sock_flush(sock);
-	CU_ASSERT(rc == 130);
+	CU_ASSERT(rc == 0);
 	CU_ASSERT(cb_arg1 == true);
 	CU_ASSERT(TAILQ_EMPTY(&sock->queued_reqs));
 

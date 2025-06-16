@@ -617,7 +617,7 @@ nvme_bdev_ctrlr_delete(struct nvme_bdev_ctrlr *nbdev_ctrlr,
 static void
 _nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr)
 {
-	struct nvme_path_id *path_id, *tmp_path;
+	struct spdk_nvme_path_id *path_id, *tmp_path;
 	struct nvme_ns *ns, *tmp_ns;
 
 	free(nvme_ctrlr->copied_ana_desc);
@@ -1175,12 +1175,11 @@ _bdev_nvme_find_io_path(struct nvme_bdev_channel *nbdev_ch)
 		io_path = nvme_io_path_get_next(nbdev_ch, io_path);
 	} while (io_path != start);
 
-	if (nbdev_ch->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_ACTIVE) {
-		/* We come here only if there is no optimized path. Cache even non_optimized
-		 * path for load balance across multiple non_optimized paths.
-		 */
-		nbdev_ch->current_io_path = non_optimized;
-	}
+	/* We come here only if there is no optimized path. Cache even non_optimized
+	 * path. If any path becomes optimized, ANA event will be received and
+	 * cache will be cleared.
+	 */
+	nbdev_ch->current_io_path = non_optimized;
 
 	return non_optimized;
 }
@@ -2033,7 +2032,7 @@ bdev_nvme_complete_pending_resets(struct nvme_ctrlr *nvme_ctrlr, bool success)
 static bool
 bdev_nvme_failover_trid(struct nvme_ctrlr *nvme_ctrlr, bool remove, bool start)
 {
-	struct nvme_path_id *path_id, *next_path;
+	struct spdk_nvme_path_id *path_id, *next_path;
 	int rc __attribute__((unused));
 
 	path_id = TAILQ_FIRST(&nvme_ctrlr->trids);
@@ -2098,15 +2097,16 @@ bdev_nvme_failover_trid(struct nvme_ctrlr *nvme_ctrlr, bool remove, bool start)
 static bool
 bdev_nvme_check_ctrlr_loss_timeout(struct nvme_ctrlr *nvme_ctrlr)
 {
-	int32_t elapsed;
+	uint32_t elapsed;
 
 	if (nvme_ctrlr->opts.ctrlr_loss_timeout_sec == 0 ||
 	    nvme_ctrlr->opts.ctrlr_loss_timeout_sec == -1) {
 		return false;
 	}
 
+	assert(nvme_ctrlr->opts.ctrlr_loss_timeout_sec >= 0);
 	elapsed = (spdk_get_ticks() - nvme_ctrlr->reset_start_tsc) / spdk_get_ticks_hz();
-	if (elapsed >= nvme_ctrlr->opts.ctrlr_loss_timeout_sec) {
+	if (elapsed >= (uint32_t)nvme_ctrlr->opts.ctrlr_loss_timeout_sec) {
 		return true;
 	} else {
 		return false;
@@ -2171,24 +2171,30 @@ enum bdev_nvme_op_after_reset {
 typedef enum bdev_nvme_op_after_reset _bdev_nvme_op_after_reset;
 
 static _bdev_nvme_op_after_reset
-bdev_nvme_check_op_after_reset(struct nvme_ctrlr *nvme_ctrlr, bool success)
+bdev_nvme_check_op_after_reset(struct nvme_ctrlr *nvme_ctrlr, bool success,
+			       bool pending_failover)
 {
 	if (nvme_ctrlr_can_be_unregistered(nvme_ctrlr)) {
 		/* Complete pending destruct after reset completes. */
 		return OP_COMPLETE_PENDING_DESTRUCT;
-	} else if (nvme_ctrlr->pending_failover) {
-		nvme_ctrlr->pending_failover = false;
-		nvme_ctrlr->reset_start_tsc = 0;
-		return OP_FAILOVER;
 	} else if (success || nvme_ctrlr->opts.reconnect_delay_sec == 0) {
-		nvme_ctrlr->reset_start_tsc = 0;
-		return OP_NONE;
+		if (pending_failover) {
+			/* This is a fix for a race condition that failover was lost
+			 * if fabric connect command got timeout while ctrlr was being
+			 * reset and reset succeeded. We check connection establishment
+			 * sequentially now but any network error can happen during reset.
+			 * We have to keep this fix.
+			 *
+			 * On the other hand, if reset failed, delayed reconnect will be
+			 * executed. In this case, we do not have to failover immediately.
+			 */
+			return OP_FAILOVER;
+		} else {
+			return OP_NONE;
+		}
 	} else if (bdev_nvme_check_ctrlr_loss_timeout(nvme_ctrlr)) {
 		return OP_DESTRUCT;
 	} else {
-		if (bdev_nvme_check_fast_io_fail_timeout(nvme_ctrlr)) {
-			nvme_ctrlr->fast_io_fail_timedout = true;
-		}
 		return OP_DELAYED_RECONNECT;
 	}
 }
@@ -2250,11 +2256,16 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 {
 	bdev_nvme_ctrlr_op_cb ctrlr_op_cb_fn = nvme_ctrlr->ctrlr_op_cb_fn;
 	void *ctrlr_op_cb_arg = nvme_ctrlr->ctrlr_op_cb_arg;
+	bool pending_failover;
 	enum bdev_nvme_op_after_reset op_after_reset;
 
 	assert(nvme_ctrlr->thread == spdk_get_thread());
 
 	pthread_mutex_lock(&nvme_ctrlr->mutex);
+
+	pending_failover = nvme_ctrlr->pending_failover;
+	nvme_ctrlr->pending_failover = false;
+
 	if (!success) {
 		/* Connecting the active trid failed. Set the next alternate trid to the
 		 * active trid if it exists.
@@ -2289,8 +2300,12 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 
 	if (!success) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "Resetting controller failed.\n");
+		if (bdev_nvme_check_fast_io_fail_timeout(nvme_ctrlr)) {
+			nvme_ctrlr->fast_io_fail_timedout = true;
+		}
 	} else {
 		NVME_CTRLR_NOTICELOG(nvme_ctrlr, "Resetting controller successful.\n");
+		nvme_ctrlr->reset_start_tsc = 0;
 	}
 
 	nvme_ctrlr->resetting = false;
@@ -2300,7 +2315,7 @@ bdev_nvme_reset_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr, bool success)
 	nvme_ctrlr->ctrlr_op_cb_fn = NULL;
 	nvme_ctrlr->ctrlr_op_cb_arg = NULL;
 
-	op_after_reset = bdev_nvme_check_op_after_reset(nvme_ctrlr, success);
+	op_after_reset = bdev_nvme_check_op_after_reset(nvme_ctrlr, success, pending_failover);
 	pthread_mutex_unlock(&nvme_ctrlr->mutex);
 
 	/* Delay callbacks when the next operation is a failover. */
@@ -2617,10 +2632,11 @@ bdev_nvme_reset_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, spdk_msg_fn *msg_fn)
 		nvme_ctrlr->reconnect_is_delayed = false;
 	} else {
 		*msg_fn = _bdev_nvme_reset_ctrlr;
-		assert(nvme_ctrlr->reset_start_tsc == 0);
 	}
 
-	nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+	if (nvme_ctrlr->reset_start_tsc == 0) {
+		nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+	}
 
 	return 0;
 }
@@ -2688,8 +2704,9 @@ bdev_nvme_disable_ctrlr_complete(struct nvme_ctrlr *nvme_ctrlr)
 
 	nvme_ctrlr->resetting = false;
 	nvme_ctrlr->dont_retry = false;
+	nvme_ctrlr->pending_failover = false;
 
-	op_after_disable = bdev_nvme_check_op_after_reset(nvme_ctrlr, true);
+	op_after_disable = bdev_nvme_check_op_after_reset(nvme_ctrlr, true, false);
 
 	nvme_ctrlr->disabled = true;
 	spdk_poller_pause(nvme_ctrlr->adminq_timer_poller);
@@ -3200,8 +3217,9 @@ bdev_nvme_failover_ctrlr_unsafe(struct nvme_ctrlr *nvme_ctrlr, bool remove)
 	nvme_ctrlr->resetting = true;
 	nvme_ctrlr->in_failover = true;
 
-	assert(nvme_ctrlr->reset_start_tsc == 0);
-	nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+	if (nvme_ctrlr->reset_start_tsc == 0) {
+		nvme_ctrlr->reset_start_tsc = spdk_get_ticks();
+	}
 
 	return 0;
 }
@@ -3934,7 +3952,7 @@ nvme_ctrlr_info_json(struct spdk_json_write_ctx *w, struct nvme_ctrlr *nvme_ctrl
 	struct spdk_nvme_transport_id *trid;
 	const struct spdk_nvme_ctrlr_opts *opts;
 	const struct spdk_nvme_ctrlr_data *cdata;
-	struct nvme_path_id *path_id;
+	struct spdk_nvme_path_id *path_id;
 	int32_t numa_id;
 
 	spdk_json_write_object_begin(w);
@@ -5853,7 +5871,7 @@ nvme_ctrlr_create(struct spdk_nvme_ctrlr *ctrlr,
 		  struct nvme_async_probe_ctx *ctx)
 {
 	struct nvme_ctrlr *nvme_ctrlr;
-	struct nvme_path_id *path_id;
+	struct spdk_nvme_path_id *path_id;
 	const struct spdk_nvme_ctrlr_data *cdata;
 	struct spdk_event_handler_opts opts = {
 		.opts_size = SPDK_SIZEOF(&opts, fd_type),
@@ -6191,6 +6209,7 @@ spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
 	SET_FIELD(dhchap_digests, 0);
 	SET_FIELD(dhchap_dhgroups, 0);
 	SET_FIELD(rdma_umr_per_io, false);
+	SET_FIELD(tcp_connect_timeout_ms, 0);
 
 #undef SET_FIELD
 
@@ -6267,6 +6286,9 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	if (drv_opts.rdma_umr_per_io != opts->rdma_umr_per_io) {
 		drv_opts.rdma_umr_per_io = opts->rdma_umr_per_io;
 	}
+	if (opts->tcp_connect_timeout_ms != 0) {
+		drv_opts.tcp_connect_timeout_ms = opts->tcp_connect_timeout_ms;
+	}
 	ret = spdk_nvme_transport_set_opts(&drv_opts, sizeof(drv_opts));
 	if (ret) {
 		SPDK_ERRLOG("Failed to set NVMe transport opts.\n");
@@ -6305,6 +6327,7 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	SET_FIELD(rdma_cm_event_timeout_ms, 0);
 	SET_FIELD(dhchap_digests, 0);
 	SET_FIELD(dhchap_dhgroups, 0);
+	SET_FIELD(tcp_connect_timeout_ms, 0);
 
 	g_opts.opts_size = opts->opts_size;
 
@@ -6422,7 +6445,7 @@ bdev_nvme_check_secondary_trid(struct nvme_ctrlr *nvme_ctrlr,
 			       struct spdk_nvme_ctrlr *new_ctrlr,
 			       struct spdk_nvme_transport_id *trid)
 {
-	struct nvme_path_id *tmp_trid;
+	struct spdk_nvme_path_id *tmp_trid;
 
 	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		NVME_CTRLR_ERRLOG(nvme_ctrlr, "PCIe failover is not supported.\n");
@@ -6485,7 +6508,7 @@ static int
 _bdev_nvme_add_secondary_trid(struct nvme_ctrlr *nvme_ctrlr,
 			      struct spdk_nvme_transport_id *trid)
 {
-	struct nvme_path_id *active_id, *new_trid, *tmp_trid;
+	struct spdk_nvme_path_id *active_id, *new_trid, *tmp_trid;
 
 	new_trid = calloc(1, sizeof(*new_trid));
 	if (new_trid == NULL) {
@@ -6815,9 +6838,9 @@ spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 
 struct bdev_nvme_delete_ctx {
 	char                        *name;
-	struct nvme_path_id         path_id;
-	bdev_nvme_delete_done_fn    delete_done;
-	void                        *delete_done_ctx;
+	struct spdk_nvme_path_id    path_id;
+	spdk_bdev_nvme_delete_cb    delete_cb;
+	void                        *delete_cb_ctx;
 	uint64_t                    timeout_ticks;
 	struct spdk_poller          *poller;
 };
@@ -6832,7 +6855,7 @@ free_bdev_nvme_delete_ctx(struct bdev_nvme_delete_ctx *ctx)
 }
 
 static bool
-nvme_path_id_compare(struct nvme_path_id *p, const struct nvme_path_id *path_id)
+nvme_path_id_compare(struct spdk_nvme_path_id *p, const struct spdk_nvme_path_id *path_id)
 {
 	if (path_id->trid.trtype != 0) {
 		if (path_id->trid.trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
@@ -6886,11 +6909,11 @@ nvme_path_id_compare(struct nvme_path_id *p, const struct nvme_path_id *path_id)
 }
 
 static bool
-nvme_path_id_exists(const char *name, const struct nvme_path_id *path_id)
+nvme_path_id_exists(const char *name, const struct spdk_nvme_path_id *path_id)
 {
 	struct nvme_bdev_ctrlr  *nbdev_ctrlr;
 	struct nvme_ctrlr       *ctrlr;
-	struct nvme_path_id     *p;
+	struct spdk_nvme_path_id     *p;
 
 	pthread_mutex_lock(&g_bdev_nvme_mutex);
 	nbdev_ctrlr = nvme_bdev_ctrlr_get_by_name(name);
@@ -6932,16 +6955,16 @@ bdev_nvme_delete_complete_poll(void *arg)
 
 	spdk_poller_unregister(&ctx->poller);
 
-	ctx->delete_done(ctx->delete_done_ctx, rc);
+	ctx->delete_cb(ctx->delete_cb_ctx, rc);
 	free_bdev_nvme_delete_ctx(ctx);
 
 	return SPDK_POLLER_BUSY;
 }
 
 static int
-_bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, const struct nvme_path_id *path_id)
+_bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, const struct spdk_nvme_path_id *path_id)
 {
-	struct nvme_path_id	*p, *t;
+	struct spdk_nvme_path_id	*p, *t;
 	spdk_msg_fn		msg_fn;
 	int			rc = -ENXIO;
 
@@ -6994,8 +7017,8 @@ _bdev_nvme_delete(struct nvme_ctrlr *nvme_ctrlr, const struct nvme_path_id *path
 }
 
 int
-bdev_nvme_delete(const char *name, const struct nvme_path_id *path_id,
-		 bdev_nvme_delete_done_fn delete_done, void *delete_done_ctx)
+spdk_bdev_nvme_delete(const char *name, const struct spdk_nvme_path_id *path_id,
+		      spdk_bdev_nvme_delete_cb delete_cb, void *cb_ctx)
 {
 	struct nvme_bdev_ctrlr		*nbdev_ctrlr;
 	struct nvme_ctrlr		*nvme_ctrlr, *tmp_nvme_ctrlr;
@@ -7035,7 +7058,7 @@ bdev_nvme_delete(const char *name, const struct nvme_path_id *path_id,
 
 	pthread_mutex_unlock(&g_bdev_nvme_mutex);
 
-	if (rc != 0 || delete_done == NULL) {
+	if (rc != 0 || delete_cb == NULL) {
 		goto exit;
 	}
 
@@ -7053,8 +7076,8 @@ bdev_nvme_delete(const char *name, const struct nvme_path_id *path_id,
 		goto exit;
 	}
 
-	ctx->delete_done = delete_done;
-	ctx->delete_done_ctx = delete_done_ctx;
+	ctx->delete_cb = delete_cb;
+	ctx->delete_cb_ctx = cb_ctx;
 	ctx->path_id = *path_id;
 	ctx->timeout_ticks = spdk_get_ticks() + 10 * spdk_get_ticks_hz();
 	ctx->poller = SPDK_POLLER_REGISTER(bdev_nvme_delete_complete_poll, ctx, 1000);
@@ -7216,11 +7239,11 @@ _stop_discovery(void *_ctx)
 
 	while (!TAILQ_EMPTY(&ctx->nvm_entry_ctxs)) {
 		struct discovery_entry_ctx *entry_ctx;
-		struct nvme_path_id path = {};
+		struct spdk_nvme_path_id path = {};
 
 		entry_ctx = TAILQ_FIRST(&ctx->nvm_entry_ctxs);
 		path.trid = entry_ctx->trid;
-		bdev_nvme_delete(entry_ctx->name, &path, NULL, NULL);
+		spdk_bdev_nvme_delete(entry_ctx->name, &path, NULL, NULL);
 		TAILQ_REMOVE(&ctx->nvm_entry_ctxs, entry_ctx, tailq);
 		free(entry_ctx);
 	}
@@ -7255,7 +7278,7 @@ static void
 remove_discovery_entry(struct nvme_ctrlr *nvme_ctrlr)
 {
 	struct discovery_ctx *d_ctx;
-	struct nvme_path_id *path_id;
+	struct spdk_nvme_path_id *path_id;
 	struct spdk_nvme_transport_id trid = {};
 	struct discovery_entry_ctx *entry_ctx, *tmp;
 
@@ -7304,13 +7327,13 @@ discovery_remove_controllers(struct discovery_ctx *ctx)
 			}
 		}
 		if (!found) {
-			struct nvme_path_id path = {};
+			struct spdk_nvme_path_id path = {};
 
 			DISCOVERY_INFOLOG(ctx, "NVM %s:%s:%s not found\n",
 					  old_trid.subnqn, old_trid.traddr, old_trid.trsvcid);
 
 			path.trid = entry_ctx->trid;
-			bdev_nvme_delete(entry_ctx->name, &path, NULL, NULL);
+			spdk_bdev_nvme_delete(entry_ctx->name, &path, NULL, NULL);
 			TAILQ_REMOVE(&ctx->nvm_entry_ctxs, entry_ctx, tailq);
 			free(entry_ctx);
 		}
@@ -8903,6 +8926,7 @@ bdev_nvme_opts_config_json(struct spdk_json_write_ctx *w)
 
 	spdk_json_write_array_end(w);
 	spdk_json_write_named_bool(w, "rdma_umr_per_io", g_opts.rdma_umr_per_io);
+	spdk_json_write_named_uint32(w, "tcp_connect_timeout_ms", g_opts.tcp_connect_timeout_ms);
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);
@@ -8963,7 +8987,7 @@ nvme_ctrlr_cuse_config_json(struct spdk_json_write_ctx *w,
 static void
 nvme_ctrlr_config_json(struct spdk_json_write_ctx *w,
 		       struct nvme_ctrlr *nvme_ctrlr,
-		       struct nvme_path_id *path_id)
+		       struct spdk_nvme_path_id *path_id)
 {
 	struct spdk_nvme_transport_id	*trid;
 	const struct spdk_nvme_ctrlr_opts *opts;
@@ -9037,19 +9061,47 @@ bdev_nvme_hotplug_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_object_end(w);
 }
 
+static void
+bdev_nvme_multipath_config_json(struct nvme_bdev *nbdev, struct spdk_json_write_ctx *w)
+{
+	/* Skip dump if it is matching the default conf. */
+	if (nbdev->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE &&
+	    nbdev->mp_selector == BDEV_NVME_MP_SELECTOR_ROUND_ROBIN && nbdev->rr_min_io == UINT32_MAX) {
+		return;
+	}
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "bdev_nvme_set_multipath_policy");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", nbdev->disk.name);
+	spdk_json_write_named_string(w, "policy", nvme_bdev_get_mp_policy_str(nbdev));
+	if (nbdev->mp_policy == BDEV_NVME_MP_POLICY_ACTIVE_ACTIVE) {
+		spdk_json_write_named_string(w, "selector", nvme_bdev_get_mp_selector_str(nbdev));
+		if (nbdev->mp_selector == BDEV_NVME_MP_SELECTOR_ROUND_ROBIN) {
+			spdk_json_write_named_uint32(w, "rr_min_io", nbdev->rr_min_io);
+		}
+	}
+
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+}
+
 static int
 bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 {
 	struct nvme_bdev_ctrlr	*nbdev_ctrlr;
 	struct nvme_ctrlr	*nvme_ctrlr;
 	struct discovery_ctx	*ctx;
-	struct nvme_path_id	*path_id;
+	struct spdk_nvme_path_id	*path_id;
 
 	bdev_nvme_opts_config_json(w);
 
 	pthread_mutex_lock(&g_bdev_nvme_mutex);
 
 	TAILQ_FOREACH(nbdev_ctrlr, &g_nvme_bdev_ctrlrs, tailq) {
+		struct nvme_bdev *nbdev;
+
 		TAILQ_FOREACH(nvme_ctrlr, &nbdev_ctrlr->ctrlrs, tailq) {
 			path_id = nvme_ctrlr->active_path_id;
 			assert(path_id == TAILQ_FIRST(&nvme_ctrlr->trids));
@@ -9064,6 +9116,10 @@ bdev_nvme_config_json(struct spdk_json_write_ctx *w)
 #ifdef SPDK_CONFIG_NVME_CUSE
 			nvme_ctrlr_cuse_config_json(w, nvme_ctrlr);
 #endif
+		}
+
+		TAILQ_FOREACH(nbdev, &nbdev_ctrlr->bdevs, tailq) {
+			bdev_nvme_multipath_config_json(nbdev, w);
 		}
 	}
 
@@ -9127,22 +9183,7 @@ nvme_io_path_is_current(struct nvme_io_path *io_path)
 		current = (io_path->nvme_ns->ana_state == SPDK_NVME_ANA_OPTIMIZED_STATE) ||
 			  (optimized_io_path == NULL);
 	} else {
-		if (nbdev_ch->current_io_path) {
-			current = (io_path == nbdev_ch->current_io_path);
-		} else {
-			struct nvme_io_path *first_path;
-
-			/* We arrived here as there are no optimized paths for active-passive
-			 * mode. Check if this io_path is the first one available on the list.
-			 */
-			current = false;
-			STAILQ_FOREACH(first_path, &nbdev_ch->io_path_list, stailq) {
-				if (nvme_io_path_is_available(first_path)) {
-					current = (io_path == first_path);
-					break;
-				}
-			}
-		}
+		current = (io_path == nbdev_ch->current_io_path);
 	}
 
 	return current;

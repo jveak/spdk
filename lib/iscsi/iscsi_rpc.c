@@ -1987,7 +1987,9 @@ rpc_iscsi_get_histogram(struct spdk_jsonrpc_request *request,
 
 	spdk_json_write_object_begin(w);
 	spdk_json_write_named_string(w, "histogram", encoded_histogram);
-	spdk_json_write_named_int64(w, "bucket_shift", target->histogram->bucket_shift);
+	spdk_json_write_named_int64(w, "granularity", target->histogram->granularity);
+	spdk_json_write_named_uint32(w, "min_range", target->histogram->min_range);
+	spdk_json_write_named_uint32(w, "max_range", target->histogram->max_range);
 	spdk_json_write_named_int64(w, "tsc_rate", spdk_get_ticks_hz());
 
 	spdk_json_write_object_end(w);

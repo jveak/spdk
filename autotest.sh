@@ -32,12 +32,13 @@ fi
 if [ $(uname -s) = Linux ]; then
 	old_core_pattern=$(< /proc/sys/kernel/core_pattern)
 	mkdir -p "$output_dir/coredumps"
-	# Set core_pattern to a known value to avoid ABRT, systemd-coredump, etc.
-	# Dump the $output_dir path to a file so collector can pick it up while executing.
-	# We don't set in in the core_pattern command line because of the string length limitation
-	# of 128 bytes. See 'man core 5' for details.
-	echo "|$rootdir/scripts/core-collector.sh %P %s %t" > /proc/sys/kernel/core_pattern
-	echo "$output_dir/coredumps" > "$rootdir/.coredump_path"
+	# Set core_pattern to a known value to avoid looking for cores handled by different
+	# entities, like apport, systemd-coredump, etc. We also don't want to pipe core to our
+	# own collector as under SELINUX it won't be able to execute due to limitation
+	# kernel_generic_help_t|kernel_t domains may impose. Stick to a simple pattern
+	# pointing at $output_dir/coredumps - when autotest finishes, process_core() will
+	# pick any core from that location.
+	echo "$output_dir/coredumps/%s-%p-%i-%t-%E.core" > /proc/sys/kernel/core_pattern
 
 	# make sure nbd (network block device) driver is loaded if it is available
 	# this ensures that when tests need to use nbd, it will be fully initialized
@@ -393,17 +394,4 @@ chmod a+r $output_dir/timing.txt
 
 [[ -f "$output_dir/udev.log" ]] && rm -f "$output_dir/udev.log"
 
-if [[ $CONFIG_COVERAGE == y ]]; then
-	# generate coverage data and combine with baseline
-	$LCOV -q -c --no-external -d $src -t "$(hostname)" -o $out/cov_test.info
-	$LCOV -q -a $out/cov_base.info -a $out/cov_test.info -o $out/cov_total.info
-	$LCOV -q -r $out/cov_total.info '*/dpdk/*' -o $out/cov_total.info
-	# C++ headers in /usr can sometimes generate data even when specifying
-	# --no-external, so remove them. But we need to add an ignore-errors
-	# flag to squash warnings on systems where they don't generate data.
-	$LCOV -q -r $out/cov_total.info --ignore-errors unused,unused '/usr/*' -o $out/cov_total.info
-	$LCOV -q -r $out/cov_total.info '*/examples/vmd/*' -o $out/cov_total.info
-	$LCOV -q -r $out/cov_total.info '*/app/spdk_lspci/*' -o $out/cov_total.info
-	$LCOV -q -r $out/cov_total.info '*/app/spdk_top/*' -o $out/cov_total.info
-	rm -f cov_base.info cov_test.info OLD_STDOUT OLD_STDERR
-fi
+gather_coverage

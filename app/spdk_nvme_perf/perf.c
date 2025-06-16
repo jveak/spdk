@@ -12,6 +12,7 @@
 #include "spdk/env.h"
 #include "spdk/fd.h"
 #include "spdk/nvme.h"
+#include "spdk_internal/nvme_util.h"
 #include "spdk/vmd.h"
 #include "spdk/queue.h"
 #include "spdk/string.h"
@@ -85,7 +86,7 @@ struct ns_entry {
 	uint32_t		block_size;
 	uint32_t		md_size;
 	bool			md_interleave;
-	unsigned int		seed;
+	uint64_t		seed;
 	struct spdk_zipf	*zipf;
 	bool			pi_loc;
 	enum spdk_nvme_pi_type	pi_type;
@@ -270,7 +271,7 @@ static char *g_sock_threshold_impl;
 static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
-static struct spdk_key *g_psk = NULL;
+static struct spdk_key *g_psk = NULL, *g_dhchap = NULL, *g_dhchap_ctrlr = NULL;
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -300,14 +301,14 @@ static pthread_mutex_t g_stats_mutex;
 #define MAX_ALLOWED_PCI_DEVICE_NUM 128
 static struct spdk_pci_addr g_allowed_pci_addr[MAX_ALLOWED_PCI_DEVICE_NUM];
 
-struct trid_entry {
-	struct spdk_nvme_transport_id	trid;
-	uint16_t			nsid;
-	char				hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
-	TAILQ_ENTRY(trid_entry)		tailq;
+struct _trid_entry {
+	struct spdk_nvme_trid_entry entry;
+	TAILQ_ENTRY(_trid_entry) tailq;
 };
 
-static TAILQ_HEAD(, trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list);
+#define MAX_TRID_ENTRY 256
+static struct _trid_entry g_trids[MAX_TRID_ENTRY];
+static TAILQ_HEAD(, _trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list);
 
 static int g_file_optind; /* Index of first filename in argv */
 
@@ -1211,50 +1212,6 @@ static const struct ns_fn_table nvme_fn_table = {
 	.dump_transport_stats	= nvme_dump_transport_stats
 };
 
-static int
-build_nvme_name(char *name, size_t length, struct spdk_nvme_ctrlr *ctrlr)
-{
-	const struct spdk_nvme_transport_id *trid;
-	int res = 0;
-
-	trid = spdk_nvme_ctrlr_get_transport_id(ctrlr);
-
-	switch (trid->trtype) {
-	case SPDK_NVME_TRANSPORT_PCIE:
-		res = snprintf(name, length, "PCIE (%s)", trid->traddr);
-		break;
-	case SPDK_NVME_TRANSPORT_RDMA:
-		res = snprintf(name, length, "RDMA (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
-		break;
-	case SPDK_NVME_TRANSPORT_TCP:
-		res = snprintf(name, length, "TCP (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
-		break;
-	case SPDK_NVME_TRANSPORT_VFIOUSER:
-		res = snprintf(name, length, "VFIOUSER (%s)", trid->traddr);
-		break;
-	case SPDK_NVME_TRANSPORT_CUSTOM:
-		res = snprintf(name, length, "CUSTOM (%s)", trid->traddr);
-		break;
-
-	default:
-		fprintf(stderr, "Unknown transport type %d\n", trid->trtype);
-		break;
-	}
-	return res;
-}
-
-static void
-build_nvme_ns_name(char *name, size_t length, struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid)
-{
-	int res = 0;
-
-	res = build_nvme_name(name, length, ctrlr);
-	if (res > 0) {
-		snprintf(name + res, length - res, " NSID %u", nsid);
-	}
-
-}
-
 static void
 register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 {
@@ -1320,7 +1277,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
 
 	if (g_is_random) {
-		entry->seed = rand();
+		entry->seed = spdk_rand_xorshift64_seed();
 		if (g_zipf_theta > 0) {
 			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, 0);
 		}
@@ -1362,7 +1319,7 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		g_max_io_size_blocks = entry->io_size_blocks;
 	}
 
-	build_nvme_ns_name(entry->name, sizeof(entry->name), ctrlr, spdk_nvme_ns_get_id(ns));
+	spdk_nvme_build_name(entry->name, sizeof(entry->name), ctrlr, ns);
 
 	g_num_namespaces++;
 	TAILQ_INSERT_TAIL(&g_namespaces, entry, link);
@@ -1424,7 +1381,7 @@ set_latency_tracking_feature(struct spdk_nvme_ctrlr *ctrlr, bool enable)
 }
 
 static void
-register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct trid_entry *trid_entry)
+register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_trid_entry *trid_entry)
 {
 	struct spdk_nvme_ns *ns;
 	struct ctrlr_entry *entry = malloc(sizeof(struct ctrlr_entry));
@@ -1442,7 +1399,9 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct trid_entry *trid_entry)
 		exit(1);
 	}
 
-	build_nvme_name(entry->name, sizeof(entry->name), ctrlr);
+	spdk_nvme_build_name(entry->name, sizeof(entry->name), ctrlr, NULL);
+	printf("Attached to NVMe%s Controller at %s\n",
+	       trid_entry->trid.trtype != SPDK_NVME_TRANSPORT_PCIE ? "oF" : "", entry->name);
 
 	entry->ctrlr = ctrlr;
 	entry->trtype = trid_entry->trid.trtype;
@@ -1486,13 +1445,7 @@ submit_single_io(struct perf_task *task)
 	if (entry->zipf) {
 		offset_in_ios = spdk_zipf_generate(entry->zipf);
 	} else if (g_is_random) {
-		/* rand_r() returns int, so we need to use two calls to ensure
-		 * we get a large enough value to cover a very large block
-		 * device.
-		 */
-		rand_value = (uint64_t)rand_r(&entry->seed) *
-			     ((uint64_t)RAND_MAX + 1) +
-			     rand_r(&entry->seed);
+		rand_value = spdk_rand_xorshift64(&entry->seed);
 		offset_in_ios = rand_value % entry->size_in_ios;
 	} else {
 		offset_in_ios = ns_ctx->offset_in_ios++;
@@ -1504,7 +1457,8 @@ submit_single_io(struct perf_task *task)
 	task->submit_tsc = spdk_get_ticks();
 
 	if ((g_rw_percentage == 100) ||
-	    (g_rw_percentage != 0 && ((rand_r(&entry->seed) % 100) < g_rw_percentage))) {
+	    (g_rw_percentage != 0 &&
+	     ((spdk_rand_xorshift64(&entry->seed) % 100) < (uint64_t)g_rw_percentage))) {
 		task->is_read = true;
 	} else {
 		task->is_read = false;
@@ -1895,19 +1849,9 @@ usage(char *program_name)
 	printf("\t-a, --warmup-time <sec> warmup time in seconds\n");
 	printf("\t-c, --core-mask <mask> core mask for I/O submission/completion.\n");
 	printf("\t\t(default: 1)\n");
-	printf("\t-r, --transport <fmt> Transport ID for local PCIe NVMe or NVMeoF\n");
-	printf("\t\t Format: 'key:value [key:value] ...'\n");
-	printf("\t\t Keys:\n");
-	printf("\t\t  trtype      Transport type (e.g. PCIe, RDMA)\n");
-	printf("\t\t  adrfam      Address family (e.g. IPv4, IPv6)\n");
-	printf("\t\t  traddr      Transport address (e.g. 0000:04:00.0 for PCIe or 192.168.100.8 for RDMA)\n");
-	printf("\t\t  trsvcid     Transport service identifier (e.g. 4420)\n");
-	printf("\t\t  subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
-	printf("\t\t  ns          NVMe namespace ID (all active namespaces are used by default)\n");
-	printf("\t\t  hostnqn     Host NQN\n");
-	printf("\t\t Example: -r 'trtype:PCIe traddr:0000:04:00.0' for PCIe or\n");
-	printf("\t\t          -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420' for NVMeoF\n");
-	printf("\t\t Note: can be specified multiple times to test multiple disks/targets.\n");
+	spdk_nvme_transport_id_usage(stdout,
+				     SPDK_NVME_TRID_USAGE_OPT_LONGOPT | SPDK_NVME_TRID_USAGE_OPT_MULTI | SPDK_NVME_TRID_USAGE_OPT_NS |
+				     SPDK_NVME_TRID_USAGE_OPT_HOSTNQN);
 	printf("\n");
 
 	printf("==== ADVANCED OPTIONS ====\n\n");
@@ -1954,6 +1898,8 @@ usage(char *program_name)
 	printf("\t--tls-version <val> TLS version to use. Only valid for ssl impl. Default: 0 (auto-negotiation)\n");
 	printf("\t--psk-path <val> Path to PSK file (only applies when sock_impl == ssl)\n");
 	printf("\t--psk-identity <val> Default PSK ID, e.g. psk.spdk.io (only applies when sock_impl == ssl)\n");
+	printf("\t--dhchap-key <val> Path to DH-HMAC-CHAP key file (required if controller key is specified)\n");
+	printf("\t--dhchap-ctrlr-key <val> Path to DH-HMAC-CHAP controller key file\n");
 	printf("\t--zerocopy-threshold <val> data is sent with MSG_ZEROCOPY if size is greater than this val. Default: 0 to disable it\n");
 	printf("\t--zerocopy-threshold-sock-impl <impl> specify the sock implementation to set zerocopy_threshold\n");
 	printf("\t-z, --disable-zcopy <impl> disable zero copy send for the given sock implementation. Default for posix impl\n");
@@ -2201,89 +2147,6 @@ print_stats(void)
 			print_latency_statistics("Write", SPDK_NVME_INTEL_LOG_WRITE_CMD_LATENCY);
 		}
 	}
-}
-
-static void
-unregister_trids(void)
-{
-	struct trid_entry *trid_entry, *tmp;
-
-	TAILQ_FOREACH_SAFE(trid_entry, &g_trid_list, tailq, tmp) {
-		TAILQ_REMOVE(&g_trid_list, trid_entry, tailq);
-		free(trid_entry);
-	}
-}
-
-static int
-add_trid(const char *trid_str)
-{
-	struct trid_entry *trid_entry;
-	struct spdk_nvme_transport_id *trid;
-	char *ns;
-	char *hostnqn;
-
-	trid_entry = calloc(1, sizeof(*trid_entry));
-	if (trid_entry == NULL) {
-		return -1;
-	}
-
-	trid = &trid_entry->trid;
-	trid->trtype = SPDK_NVME_TRANSPORT_PCIE;
-	snprintf(trid->subnqn, sizeof(trid->subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
-
-	if (spdk_nvme_transport_id_parse(trid, trid_str) != 0) {
-		fprintf(stderr, "Invalid transport ID format '%s'\n", trid_str);
-		free(trid_entry);
-		return 1;
-	}
-
-	if ((ns = strcasestr(trid_str, "ns:")) ||
-	    (ns = strcasestr(trid_str, "ns="))) {
-		char nsid_str[6]; /* 5 digits maximum in an nsid */
-		int len;
-		int nsid;
-
-		ns += 3;
-
-		len = strcspn(ns, " \t\n");
-		if (len > 5) {
-			fprintf(stderr, "NVMe namespace IDs must be 5 digits or less\n");
-			free(trid_entry);
-			return 1;
-		}
-
-		memcpy(nsid_str, ns, len);
-		nsid_str[len] = '\0';
-
-		nsid = spdk_strtol(nsid_str, 10);
-		if (nsid <= 0 || nsid > 65535) {
-			fprintf(stderr, "NVMe namespace IDs must be less than 65536 and greater than 0\n");
-			free(trid_entry);
-			return 1;
-		}
-
-		trid_entry->nsid = (uint16_t)nsid;
-	}
-
-	if ((hostnqn = strcasestr(trid_str, "hostnqn:")) ||
-	    (hostnqn = strcasestr(trid_str, "hostnqn="))) {
-		size_t len;
-
-		hostnqn += strlen("hostnqn:");
-
-		len = strcspn(hostnqn, " \t\n");
-		if (len > (sizeof(trid_entry->hostnqn) - 1)) {
-			fprintf(stderr, "Host NQN is too long\n");
-			free(trid_entry);
-			return 1;
-		}
-
-		memcpy(trid_entry->hostnqn, hostnqn, len);
-		trid_entry->hostnqn[len] = '\0';
-	}
-
-	TAILQ_INSERT_TAIL(&g_trid_list, trid_entry, tailq);
-	return 0;
 }
 
 static int
@@ -2535,6 +2398,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"use-every-core", no_argument, NULL, PERF_USE_EVERY_CORE},
 #define PERF_NO_HUGE		270
 	{"no-huge", no_argument, NULL, PERF_NO_HUGE},
+#define PERF_DHCHAP_PATH		271
+	{"dhchap-key", required_argument, NULL, PERF_DHCHAP_PATH},
+#define PERF_DHCHAP_CTRLR_PATH		272
+	{"dhchap-ctrlr-key", required_argument, NULL, PERF_DHCHAP_CTRLR_PATH},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -2549,6 +2416,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	char *endptr;
 	bool ssl_used = false;
 	char *sock_impl = "posix";
+	uint32_t trid_count = 0;
 
 	while ((op = getopt_long(argc, argv, PERF_GETOPT_SHORT, g_perf_cmdline_opts, &long_idx)) != -1) {
 		switch (op) {
@@ -2682,10 +2550,19 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			g_monitor_perf_cores = true;
 			break;
 		case PERF_TRANSPORT:
-			if (add_trid(optarg)) {
+			if (trid_count == MAX_TRID_ENTRY) {
+				fprintf(stderr, "Number of Transport ID specified with -r is limited to %u\n", MAX_TRID_ENTRY);
+				return 1;
+			}
+
+			rc = spdk_nvme_trid_entry_parse(&g_trids[trid_count].entry, optarg);
+			if (rc < 0) {
 				usage(argv[0]);
 				return 1;
 			}
+
+			TAILQ_INSERT_TAIL(&g_trid_list, &g_trids[trid_count], tailq);
+			++trid_count;
 			break;
 		case PERF_IO_PATTERN:
 			g_workload_type = optarg;
@@ -2771,6 +2648,22 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_PSK_IDENTITY:
 			ssl_used = true;
 			perf_set_sock_opts("ssl", "psk_identity", 0, optarg);
+			break;
+		case PERF_DHCHAP_PATH:
+			free_key(&g_dhchap);
+			g_dhchap = alloc_key("perf-dhchap", optarg);
+			if (g_dhchap == NULL) {
+				fprintf(stderr, "Unable to set dhchap at %s\n", optarg);
+				return 1;
+			}
+			break;
+		case PERF_DHCHAP_CTRLR_PATH:
+			free_key(&g_dhchap_ctrlr);
+			g_dhchap_ctrlr = alloc_key("perf-dhchap-ctrlr", optarg);
+			if (g_dhchap_ctrlr == NULL) {
+				fprintf(stderr, "Unable to set dhchap-ctrl at %s\n", optarg);
+				return 1;
+			}
 			break;
 		case PERF_DISABLE_ZCOPY:
 			perf_set_sock_opts(optarg, "enable_zerocopy_send_client", 0, NULL);
@@ -2920,14 +2813,19 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 
 	if (TAILQ_EMPTY(&g_trid_list)) {
 		/* If no transport IDs specified, default to enumerating all local PCIe devices */
-		add_trid("trtype:PCIe");
+		rc = spdk_nvme_trid_entry_parse(&g_trids[trid_count].entry, "trtype:PCIe");
+		if (rc < 0) {
+			return 1;
+		}
+
+		TAILQ_INSERT_TAIL(&g_trid_list, &g_trids[trid_count], tailq);
 	} else {
-		struct trid_entry *trid_entry, *trid_entry_tmp;
+		struct _trid_entry *trid_entry;
 
 		env_opts->no_pci = true;
 		/* check whether there is local PCIe type */
-		TAILQ_FOREACH_SAFE(trid_entry, &g_trid_list, tailq, trid_entry_tmp) {
-			if (trid_entry->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		TAILQ_FOREACH(trid_entry, &g_trid_list, tailq) {
+			if (trid_entry->entry.trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
 				env_opts->no_pci = false;
 				break;
 			}
@@ -2985,7 +2883,7 @@ static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	 struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct trid_entry *trid_entry = cb_ctx;
+	struct spdk_nvme_trid_entry *trid_entry = cb_ctx;
 
 	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		if (g_disable_sq_cmb) {
@@ -3011,6 +2909,8 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->data_digest = g_data_digest;
 	opts->keep_alive_timeout_ms = g_keep_alive_timeout_in_ms;
 	opts->tls_psk = g_psk;
+	opts->dhchap_key = g_dhchap;
+	opts->dhchap_ctrlr_key = g_dhchap_ctrlr;
 	memcpy(opts->hostnqn, trid_entry->hostnqn, sizeof(opts->hostnqn));
 
 	opts->transport_tos = g_transport_tos;
@@ -3025,46 +2925,20 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct trid_entry	*trid_entry = cb_ctx;
-	struct spdk_pci_addr	pci_addr;
-	struct spdk_pci_device	*pci_dev;
-	struct spdk_pci_id	pci_id;
-
-	if (trid->trtype != SPDK_NVME_TRANSPORT_PCIE) {
-		printf("Attached to NVMe over Fabrics controller at %s:%s: %s\n",
-		       trid->traddr, trid->trsvcid,
-		       trid->subnqn);
-	} else {
-		if (spdk_pci_addr_parse(&pci_addr, trid->traddr)) {
-			return;
-		}
-
-		pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
-		if (!pci_dev) {
-			return;
-		}
-
-		pci_id = spdk_pci_device_get_id(pci_dev);
-
-		printf("Attached to NVMe Controller at %s [%04x:%04x]\n",
-		       trid->traddr,
-		       pci_id.vendor_id, pci_id.device_id);
-
+	if (trid->trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		if (g_enable_interrupt && !opts->enable_interrupts) {
-			fprintf(stderr, "Couldn't enable interrupts on NVMe controller at %s [%04x:%04x]\n",
-				trid->traddr,
-				pci_id.vendor_id, pci_id.device_id);
+			fprintf(stderr, "Couldn't enable interrupts on NVMe controller at %s\n", trid->traddr);
 			return;
 		}
 	}
 
-	register_ctrlr(ctrlr, trid_entry);
+	register_ctrlr(ctrlr, cb_ctx);
 }
 
 static int
 register_controllers(void)
 {
-	struct trid_entry *trid_entry;
+	struct _trid_entry *trid_entry;
 
 	printf("Initializing NVMe Controllers\n");
 
@@ -3074,9 +2948,9 @@ register_controllers(void)
 	}
 
 	TAILQ_FOREACH(trid_entry, &g_trid_list, tailq) {
-		if (spdk_nvme_probe(&trid_entry->trid, trid_entry, probe_cb, attach_cb, NULL) != 0) {
+		if (spdk_nvme_probe(&trid_entry->entry.trid, &trid_entry->entry, probe_cb, attach_cb, NULL) != 0) {
 			fprintf(stderr, "spdk_nvme_probe() failed for transport address '%s'\n",
-				trid_entry->trid.traddr);
+				trid_entry->entry.trid.traddr);
 			return -1;
 		}
 	}
@@ -3270,6 +3144,8 @@ main(int argc, char **argv)
 	rc = parse_args(argc, argv, &opts);
 	if (rc != 0 || rc == HELP_RETURN_CODE) {
 		free_key(&g_psk);
+		free_key(&g_dhchap);
+		free_key(&g_dhchap_ctrlr);
 		if (rc == HELP_RETURN_CODE) {
 			return 0;
 		}
@@ -3282,22 +3158,26 @@ main(int argc, char **argv)
 	if (rc != 0) {
 		fprintf(stderr, "Failed to init mutex\n");
 		free_key(&g_psk);
+		free_key(&g_dhchap);
+		free_key(&g_dhchap_ctrlr);
 		return -1;
 	}
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
-		unregister_trids();
 		pthread_mutex_destroy(&g_stats_mutex);
 		free_key(&g_psk);
+		free_key(&g_dhchap);
+		free_key(&g_dhchap_ctrlr);
 		return -1;
 	}
 
 	rc = spdk_keyring_init();
 	if (rc != 0) {
 		fprintf(stderr, "Unable to initialize keyring: %s\n", spdk_strerror(-rc));
-		unregister_trids();
 		pthread_mutex_destroy(&g_stats_mutex);
 		free_key(&g_psk);
+		free_key(&g_dhchap);
+		free_key(&g_dhchap_ctrlr);
 		spdk_env_fini();
 		return -1;
 	}
@@ -3402,12 +3282,13 @@ cleanup:
 		}
 	}
 
-	unregister_trids();
 	unregister_namespaces();
 	unregister_controllers();
 	unregister_workers();
 
 	free_key(&g_psk);
+	free_key(&g_dhchap);
+	free_key(&g_dhchap_ctrlr);
 	spdk_keyring_cleanup();
 	spdk_env_fini();
 

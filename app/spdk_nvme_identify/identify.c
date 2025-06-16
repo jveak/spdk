@@ -8,6 +8,7 @@
 #include "spdk/endian.h"
 #include "spdk/log.h"
 #include "spdk/nvme.h"
+#include "spdk_internal/nvme_util.h"
 #include "spdk/vmd.h"
 #include "spdk/nvme_ocssd.h"
 #include "spdk/nvme_zns.h"
@@ -93,7 +94,7 @@ static int g_main_core = 0;
 
 static char g_core_mask[20] = "0x1";
 
-static struct spdk_nvme_transport_id g_trid;
+static struct spdk_nvme_trid_entry g_trid;
 static char g_hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
 
 static int g_controllers_found = 0;
@@ -1726,9 +1727,6 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	uint8_t					str[512];
 	uint32_t				i, j;
 	struct spdk_nvme_error_information_entry *error_entry;
-	struct spdk_pci_addr			pci_addr;
-	struct spdk_pci_device			*pci_dev;
-	struct spdk_pci_id			pci_id;
 	uint32_t				nsid;
 	uint8_t					*orig_desc;
 	struct spdk_nvme_ana_group_descriptor	*copied_desc;
@@ -1752,26 +1750,8 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
 	printf("=====================================================\n");
-	if (trid->trtype != SPDK_NVME_TRANSPORT_PCIE) {
-		printf("NVMe over Fabrics controller at %s:%s: %s\n",
-		       trid->traddr, trid->trsvcid, trid->subnqn);
-	} else {
-		if (spdk_pci_addr_parse(&pci_addr, trid->traddr) != 0) {
-			return;
-		}
-
-		pci_dev = spdk_nvme_ctrlr_get_pci_device(ctrlr);
-		if (!pci_dev) {
-			return;
-		}
-
-		pci_id = spdk_pci_device_get_id(pci_dev);
-
-		printf("NVMe Controller at %04x:%02x:%02x.%x [%04x:%04x]\n",
-		       pci_addr.domain, pci_addr.bus,
-		       pci_addr.dev, pci_addr.func,
-		       pci_id.vendor_id, pci_id.device_id);
-	}
+	spdk_nvme_build_name(str, sizeof(str), ctrlr, NULL);
+	printf("NVMe%s Controller at %s\n", trid->trtype != SPDK_NVME_TRANSPORT_PCIE ? "oF" : "", str);
 	printf("=====================================================\n");
 
 	if (g_hex_dump) {
@@ -2730,39 +2710,29 @@ usage(const char *program_name)
 	printf("%s [options]", program_name);
 	printf("\n");
 	printf("options:\n");
-	printf(" -r trid    remote NVMe over Fabrics target address\n");
-	printf("    Format: 'key:value [key:value] ...'\n");
-	printf("    Keys:\n");
-	printf("     trtype      Transport type (e.g. RDMA)\n");
-	printf("     adrfam      Address family (e.g. IPv4, IPv6)\n");
-	printf("     traddr      Transport address (e.g. 192.168.100.8)\n");
-	printf("     trsvcid     Transport service identifier (e.g. 4420)\n");
-	printf("     subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
-	printf("     hostnqn     Host NQN\n");
-	printf("    Example: -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420'\n");
-
+	spdk_nvme_transport_id_usage(stdout, SPDK_NVME_TRID_USAGE_OPT_HOSTNQN);
 	spdk_log_usage(stdout, "-L");
-
-	printf(" -i         shared memory group ID\n");
-	printf(" -p         core number in decimal to run this application which started from 0\n");
-	printf(" -d         DPDK huge memory size in MB\n");
-	printf(" -g         use single file descriptor for DPDK memory segments\n");
-	printf(" -v         IOVA mode ('pa' or 'va')\n");
-	printf(" -x         print hex dump of raw data\n");
-	printf(" -z         For NVMe Zoned Namespaces, dump the full zone report (-z) or the first N entries (-z N)\n");
-	printf(" -V         enumerate VMD\n");
-	printf(" -S         socket implementation, e.g. -S uring (default is posix)\n");
-	printf(" -H         show this usage\n");
+	printf("\t-i         shared memory group ID\n");
+	printf("\t-p         core number in decimal to run this application which started from 0\n");
+	printf("\t-d         DPDK huge memory size in MB\n");
+	printf("\t-g         use single file descriptor for DPDK memory segments\n");
+	printf("\t-v         IOVA mode ('pa' or 'va')\n");
+	printf("\t-x         print hex dump of raw data\n");
+	printf("\t-z         For NVMe Zoned Namespaces, dump the full zone report (-z) or the first N entries (-z N)\n");
+	printf("\t-V         enumerate VMD\n");
+	printf("\t-S         socket implementation, e.g. -S uring (default is posix)\n");
+	printf("\t-H         show this usage\n");
 }
 
 static int
 parse_args(int argc, char **argv)
 {
 	int op, rc;
-	char *hostnqn;
 
-	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
-	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+	rc = spdk_nvme_trid_entry_parse(&g_trid, "trtype:PCIe");
+	if (rc < 0) {
+		return 1;
+	}
 
 	while ((op = getopt(argc, argv, "d:gi:op:r:v:xz::HL:S:V")) != -1) {
 		switch (op) {
@@ -2795,26 +2765,10 @@ parse_args(int argc, char **argv)
 			snprintf(g_core_mask, sizeof(g_core_mask), "0x%llx", 1ULL << g_main_core);
 			break;
 		case 'r':
-			if (spdk_nvme_transport_id_parse(&g_trid, optarg) != 0) {
-				fprintf(stderr, "Error parsing transport address\n");
+			rc = spdk_nvme_trid_entry_parse(&g_trid, optarg);
+			if (rc < 0) {
+				usage(argv[0]);
 				return 1;
-			}
-
-			assert(optarg != NULL);
-			hostnqn = strcasestr(optarg, "hostnqn:");
-			if (hostnqn) {
-				size_t len;
-
-				hostnqn += strlen("hostnqn:");
-
-				len = strcspn(hostnqn, " \t\n");
-				if (len > (sizeof(g_hostnqn) - 1)) {
-					fprintf(stderr, "Host NQN is too long\n");
-					return 1;
-				}
-
-				memcpy(g_hostnqn, hostnqn, len);
-				g_hostnqn[len] = '\0';
 			}
 			break;
 		case 'v':
@@ -2909,7 +2863,7 @@ main(int argc, char **argv)
 	opts.core_mask = g_core_mask;
 	opts.hugepage_single_segments = g_dpdk_mem_single_seg;
 	opts.iova_mode = g_iova_mode;
-	if (g_trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
+	if (g_trid.trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
 		opts.no_pci = true;
 	}
 	if (spdk_env_init(&opts) < 0) {
@@ -2923,14 +2877,14 @@ main(int argc, char **argv)
 	}
 
 	/* A specific trid is required. */
-	if (strlen(g_trid.traddr) != 0) {
+	if (strlen(g_trid.trid.traddr) != 0) {
 		struct spdk_nvme_ctrlr_opts opts;
 
 		spdk_nvme_ctrlr_get_default_ctrlr_opts(&opts, sizeof(opts));
 		if (g_hostnqn[0] != '\0') {
 			memcpy(opts.hostnqn, g_hostnqn, sizeof(opts.hostnqn));
 		}
-		ctrlr = spdk_nvme_connect(&g_trid, &opts, sizeof(opts));
+		ctrlr = spdk_nvme_connect(&g_trid.trid, &opts, sizeof(opts));
 		if (!ctrlr) {
 			fprintf(stderr, "spdk_nvme_connect() failed\n");
 			rc = 1;
@@ -2938,9 +2892,9 @@ main(int argc, char **argv)
 		}
 
 		g_controllers_found++;
-		print_controller(ctrlr, &g_trid, spdk_nvme_ctrlr_get_opts(ctrlr));
+		print_controller(ctrlr, &g_trid.trid, spdk_nvme_ctrlr_get_opts(ctrlr));
 		spdk_nvme_detach_async(ctrlr, &g_detach_ctx);
-	} else if (spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL) != 0) {
+	} else if (spdk_nvme_probe(&g_trid.trid, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
 		rc = 1;
 		goto exit;

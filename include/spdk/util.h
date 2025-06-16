@@ -14,6 +14,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 
 #include "spdk/stdinc.h"
+#include "spdk/fd.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,6 +93,43 @@ extern "C" {
 
 uint32_t spdk_u32log2(uint32_t x);
 
+/**
+ * Generate a 64-bit pseudo-random number using xorshift algorithm.
+ *
+ * \param state the current seed value.
+ * \return a new pseudo-random 64-bit number.
+ */
+static inline uint64_t
+spdk_rand_xorshift64(uint64_t *state)
+{
+	uint64_t x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 7;
+	x ^= x << 17;
+
+	*state = x;
+	return x;
+}
+
+/**
+ * Generate a non-zero initial seed for xorshift64.
+ *
+ * \return a random 64-bit seed value(non-zero).
+ */
+static inline uint64_t
+spdk_rand_xorshift64_seed(void)
+{
+	uint64_t seed = ((uint64_t)rand() << 32) | rand();
+
+	/* Avoid zero seed */
+	if (seed == 0) {
+		seed = 1;
+	}
+
+	return seed;
+}
+
 static inline uint32_t
 spdk_align32pow2(uint32_t x)
 {
@@ -136,6 +174,12 @@ static inline uint64_t
 spdk_divide_round_up(uint64_t num, uint64_t divisor)
 {
 	return (num + divisor - 1) / divisor;
+}
+
+static inline uint64_t
+spdk_round_up(uint64_t num, uint64_t divisor)
+{
+	return divisor * spdk_divide_round_up(num, divisor);
 }
 
 struct spdk_single_ioviter {

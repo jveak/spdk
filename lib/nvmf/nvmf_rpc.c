@@ -24,7 +24,7 @@ static int rpc_ana_state_parse(const char *str, enum spdk_nvme_ana_state *ana_st
 static int
 json_write_hex_str(struct spdk_json_write_ctx *w, const void *data, size_t size)
 {
-	static const char hex_char[16] = "0123456789ABCDEF";
+	static const char __attribute__((nonstring)) hex_char[16] = "0123456789ABCDEF";
 	const uint8_t *buf = data;
 	char *str, *out;
 	int rc;
@@ -2529,6 +2529,14 @@ static const struct spdk_json_object_decoder nvmf_rpc_create_transport_decoder[]
 	{
 		"disable_command_passthru", offsetof(struct nvmf_rpc_create_transport_ctx, opts.disable_command_passthru),
 		spdk_json_decode_bool, true
+	},
+	{
+		"kas", offsetof(struct nvmf_rpc_create_transport_ctx, opts.kas),
+		spdk_json_decode_uint16, true
+	},
+	{
+		"min_kato", offsetof(struct nvmf_rpc_create_transport_ctx, opts.min_kato),
+		spdk_json_decode_uint32, true
 	}
 };
 
@@ -2848,6 +2856,8 @@ nvmf_qpair_state_str(enum spdk_nvmf_qpair_state state)
 		return "uninitialized";
 	case SPDK_NVMF_QPAIR_CONNECTING:
 		return "connecting";
+	case SPDK_NVMF_QPAIR_AUTHENTICATING:
+		return "authenticating";
 	case SPDK_NVMF_QPAIR_ENABLED:
 		return "enabled";
 	case SPDK_NVMF_QPAIR_DEACTIVATING:
@@ -3014,7 +3024,7 @@ rpc_nvmf_get_qpairs(struct spdk_io_channel_iter *i)
 	group = spdk_io_channel_get_ctx(ch);
 
 	TAILQ_FOREACH(qpair, &group->qpairs, link) {
-		if (qpair->ctrlr->subsys == ctx->subsystem) {
+		if (qpair->ctrlr && qpair->ctrlr->subsys == ctx->subsystem) {
 			dump_nvmf_qpair(ctx->w, qpair);
 		}
 	}

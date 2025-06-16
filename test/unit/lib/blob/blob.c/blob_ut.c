@@ -4814,6 +4814,20 @@ blob_thin_prov_unmap_cluster(void)
 	CU_ASSERT(free_clusters == spdk_bs_free_cluster_count(bs));
 	CU_ASSERT(blob->active.num_clusters == CLUSTER_COUNT);
 
+	/* Triggers a potential out-of-bounds access on blob->active.clusters,
+	 * when checking whether a extPage could be freed */
+	g_bserrno = -1;
+	spdk_blob_io_write(blob, ch, payload_write, 0, 1, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(CLUSTER_COUNT - 1 == spdk_bs_free_cluster_count(bs));
+
+	g_bserrno = -1;
+	spdk_blob_io_unmap(blob, ch, 0, io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(CLUSTER_COUNT == spdk_bs_free_cluster_count(bs));
+
 	/* Fill all clusters */
 	for (i = 0; i < CLUSTER_COUNT; i++) {
 		memset(payload_write, i + 1, sizeof(payload_write));
@@ -5802,6 +5816,61 @@ blob_inflate_rw(void)
 {
 	_blob_inflate_rw(false);
 	_blob_inflate_rw(true);
+}
+
+static void
+blob_inflate_unmap(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	struct spdk_blob *blob;
+	spdk_blob_id blobid;
+	struct spdk_io_channel *channel;
+	uint64_t io_units_per_cluster;
+	uint8_t	*payload;
+	uint32_t payload_size;
+
+	channel = spdk_bs_alloc_io_channel(bs);
+	SPDK_CU_ASSERT_FATAL(channel != NULL);
+
+	/* Create blob with 10 clusters */
+	ut_spdk_blob_opts_init(&opts);
+	opts.num_clusters = 10;
+	opts.thin_provision = true;
+
+	blob = ut_blob_create_and_open(bs, &opts);
+	blobid = spdk_blob_get_id(blob);
+	io_units_per_cluster = spdk_bs_get_cluster_size(bs) / spdk_bs_get_io_unit_size(bs);
+	CU_ASSERT(spdk_blob_get_num_clusters(blob) == 10);
+	CU_ASSERT(spdk_blob_is_thin_provisioned(blob) == true);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 0);
+
+	payload_size = opts.num_clusters * spdk_bs_get_cluster_size(bs);
+	payload = malloc(payload_size);
+	SPDK_CU_ASSERT_FATAL(payload != NULL);
+
+	spdk_blob_io_write(blob, channel, payload, 0,
+			   io_units_per_cluster, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 1);
+
+	/* During inflate, submit unmap with cluster size, the cluster should not be release to ensure the blob is thick */
+	spdk_bs_inflate_blob(bs, channel, blobid, blob_op_complete, NULL);
+	spdk_blob_io_unmap(blob, channel, 0, io_units_per_cluster,
+			   blob_op_complete, NULL);
+	poll_threads();
+
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(spdk_blob_is_thin_provisioned(blob) == false);
+	CU_ASSERT(spdk_blob_get_num_allocated_clusters(blob) == 10);
+
+	spdk_bs_free_io_channel(channel);
+	poll_threads();
+
+	free(payload);
+
+	ut_blob_close_and_delete(bs, blob);
 }
 
 /**
@@ -10253,6 +10322,7 @@ main(int argc, char **argv)
 		CU_ADD_TEST(suite, blob_delete_snapshot_power_failure);
 		CU_ADD_TEST(suite, blob_create_snapshot_power_failure);
 		CU_ADD_TEST(suite_bs, blob_inflate_rw);
+		CU_ADD_TEST(suite_bs, blob_inflate_unmap);
 		CU_ADD_TEST(suite_bs, blob_snapshot_freeze_io);
 		CU_ADD_TEST(suite_bs, blob_operation_split_rw);
 		CU_ADD_TEST(suite_bs, blob_operation_split_rw_iov);

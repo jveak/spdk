@@ -7,8 +7,8 @@
  * TCP network implementation abstraction layer
  */
 
-#ifndef SPDK_INTERNAL_SOCK_H
-#define SPDK_INTERNAL_SOCK_H
+#ifndef SPDK_INTERNAL_SOCK_MODULE_H
+#define SPDK_INTERNAL_SOCK_MODULE_H
 
 #include "spdk/stdinc.h"
 #include "spdk/sock.h"
@@ -180,7 +180,8 @@ spdk_sock_request_complete(struct spdk_sock *sock, struct spdk_sock_request *req
 
 	spdk_trace_record(TRACE_SOCK_REQ_COMPLETE, 0, 0, (uintptr_t)req, (uintptr_t)req->cb_arg);
 	req->internal.offset = 0;
-	req->internal.is_zcopy = 0;
+	req->internal.zcopy_idx = 0;
+	req->internal.pending_zcopy = false;
 
 	closed = sock->flags.closed;
 	sock->cb_cnt++;
@@ -385,6 +386,52 @@ spdk_sock_get_placement_id(int fd, enum spdk_placement_mode mode, int *placement
 }
 
 /**
+ * Converts ip and port into address.
+ *
+ * Use freeaddrinfo() when returned object is no longer needed.
+ *
+ * \return addrinfo object or NULL in case of any failures.
+ */
+struct addrinfo *spdk_sock_posix_getaddrinfo(const char *ip, int port);
+
+/**
+ * Creates sock file descriptor.
+ *
+ * Use close() when returned fd is no longer needed.
+ *
+ * \return 0 on success, negative errno value on failure.
+ */
+int spdk_sock_posix_fd_create(struct addrinfo *res, struct spdk_sock_opts *opts,
+			      struct spdk_sock_impl_opts *impl_opts);
+
+/**
+ * Connects the socket to the address.
+ *
+ * On success O_NONBLOCK is cleared otherwise property value is undefined.
+ *
+ * \return 0 on success, negative errno value on failure.
+ */
+int spdk_sock_posix_fd_connect(int fd, struct addrinfo *res, struct spdk_sock_opts *opts);
+
+/**
+ * Initiates the socket connection.
+ *
+ * On success O_NONBLOCK is set otherwise property value is undefined.
+ *
+ * User must use \ref spdk_sock_posix_fd_connect_poll_async to determine connection status.
+ *
+ * \return 0 on success, negative errno value on failure.
+ */
+int spdk_sock_posix_fd_connect_async(int fd, struct addrinfo *res, struct spdk_sock_opts *opts);
+
+/**
+ * Polls the socket connection status.
+ *
+ * \return 0 on success, negative errno value on failure.
+ */
+int spdk_sock_posix_fd_connect_poll_async(int fd);
+
+/**
  * Insert a group into the placement map.
  * If the group is already in the map, take a reference.
  */
@@ -417,4 +464,4 @@ void spdk_sock_map_cleanup(struct spdk_sock_map *map);
 }
 #endif
 
-#endif /* SPDK_INTERNAL_SOCK_H */
+#endif /* SPDK_INTERNAL_SOCK_MODULE_H */

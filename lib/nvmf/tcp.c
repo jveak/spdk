@@ -16,16 +16,17 @@
 #include "spdk/util.h"
 #include "spdk/log.h"
 #include "spdk/keyring.h"
+#include "spdk/sock.h"
 
 #include "spdk_internal/assert.h"
 #include "spdk_internal/nvme_tcp.h"
-#include "spdk_internal/sock.h"
 
 #include "nvmf_internal.h"
 #include "transport.h"
 
 #include "spdk_internal/trace_defs.h"
 
+#define MIN_SOCK_PIPE_SIZE 1024
 #define NVMF_TCP_MAX_ACCEPT_SOCK_ONE_TIME 16
 #define SPDK_NVMF_TCP_DEFAULT_MAX_SOCK_PRIORITY 16
 #define SPDK_NVMF_TCP_DEFAULT_SOCK_PRIORITY 0
@@ -551,11 +552,9 @@ static inline void
 nvmf_tcp_request_get_buffers_abort(struct spdk_nvmf_tcp_req *tcp_req)
 {
 	/* Request can wait either for the iobuf or control_msg */
-	struct spdk_nvmf_poll_group *group = tcp_req->req.qpair->group;
-	struct spdk_nvmf_transport *transport = tcp_req->req.qpair->transport;
-	struct spdk_nvmf_transport_poll_group *tgroup = nvmf_get_transport_poll_group(group, transport);
-	struct spdk_nvmf_tcp_poll_group *tcp_group = SPDK_CONTAINEROF(tgroup,
-			struct spdk_nvmf_tcp_poll_group, group);
+	struct spdk_nvmf_qpair *qpair = tcp_req->req.qpair;
+	struct spdk_nvmf_tcp_qpair *tqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_tcp_qpair, qpair);
+	struct spdk_nvmf_tcp_poll_group *tcp_group = tqpair->group;
 	struct spdk_nvmf_tcp_req *tmp_req, *abort_req;
 
 	assert(tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER);
@@ -576,24 +575,28 @@ nvmf_tcp_request_get_buffers_abort(struct spdk_nvmf_tcp_req *tcp_req)
 }
 
 static void
-nvmf_tcp_cleanup_all_states(struct spdk_nvmf_tcp_qpair *tqpair)
+nvmf_tcp_abort_await_buffer_reqs(struct spdk_nvmf_tcp_qpair *tqpair)
 {
 	struct spdk_nvmf_tcp_req *tcp_req, *req_tmp;
 
-	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_CONTROLLER_TO_HOST);
-	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEW);
-
-	/* Wipe the requests waiting for buffer from the waiting list */
+	/* Remove requests waiting for buffer from the waiting list and mark as completed */
 	TAILQ_FOREACH_SAFE(tcp_req, &tqpair->tcp_req_working_queue, state_link, req_tmp) {
 		if (tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER) {
 			nvmf_tcp_request_get_buffers_abort(tcp_req);
+			nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_COMPLETED);
 		}
 	}
+}
 
-	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEED_BUFFER);
+static void
+nvmf_tcp_cleanup_all_states(struct spdk_nvmf_tcp_qpair *tqpair)
+{
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_CONTROLLER_TO_HOST);
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_NEW);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_EXECUTING);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER);
 	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_AWAITING_R2T_ACK);
+	nvmf_tcp_drain_state_queue(tqpair, TCP_REQUEST_STATE_COMPLETED);
 }
 
 static void
@@ -1218,27 +1221,15 @@ tcp_sock_flush_cb(void *arg)
 static void
 _tcp_write_pdu(struct nvme_tcp_pdu *pdu)
 {
-	int rc;
-	uint32_t mapped_length;
 	struct spdk_nvmf_tcp_qpair *tqpair = pdu->qpair;
 
 	pdu->sock_req.iovcnt = nvme_tcp_build_iovs(pdu->iov, SPDK_COUNTOF(pdu->iov), pdu,
-			       tqpair->host_hdgst_enable, tqpair->host_ddgst_enable, &mapped_length);
+			       tqpair->host_hdgst_enable, tqpair->host_ddgst_enable, NULL);
 	spdk_sock_writev_async(tqpair->sock, &pdu->sock_req);
 
 	if (pdu->hdr.common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_IC_RESP ||
-	    pdu->hdr.common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_C2H_TERM_REQ) {
-		/* Try to force the send immediately. */
-		rc = spdk_sock_flush(tqpair->sock);
-		if (rc > 0 && (uint32_t)rc == mapped_length) {
-			_pdu_write_done(pdu, 0);
-		} else {
-			SPDK_ERRLOG("Could not write %s to socket: rc=%d, errno=%d\n",
-				    pdu->hdr.common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_IC_RESP ?
-				    "IC_RESP" : "TERM_REQ", rc, errno);
-			_pdu_write_done(pdu, rc >= 0 ? -EAGAIN : -errno);
-		}
-	} else if (spdk_interrupt_mode_is_enabled()) {
+	    pdu->hdr.common.pdu_type == SPDK_NVME_TCP_PDU_TYPE_C2H_TERM_REQ ||
+	    spdk_interrupt_mode_is_enabled()) {
 		/* Async writes must be flushed */
 		if (!tqpair->pending_flush) {
 			tqpair->pending_flush = true;
@@ -1458,9 +1449,10 @@ nvmf_tcp_qpair_init(struct spdk_nvmf_qpair *qpair)
 static int
 nvmf_tcp_qpair_sock_init(struct spdk_nvmf_tcp_qpair *tqpair)
 {
-	char saddr[32], caddr[32];
+	char saddr[SPDK_NVMF_TRADDR_MAX_LEN], caddr[SPDK_NVMF_TRADDR_MAX_LEN];
 	uint16_t sport, cport;
-	char owner[256];
+	/* 1 for colon, up to 5 for port number, 1 for null terminator */
+	char owner[sizeof(caddr) + 1 + 5 + 1];
 	int rc;
 
 	rc = spdk_sock_getaddr(tqpair->sock, saddr, sizeof(saddr), &sport,
@@ -1469,6 +1461,7 @@ nvmf_tcp_qpair_sock_init(struct spdk_nvmf_tcp_qpair *tqpair)
 		SPDK_ERRLOG("spdk_sock_getaddr() failed\n");
 		return rc;
 	}
+	/* update buffer size for owner when changing format or arguments here */
 	snprintf(owner, sizeof(owner), "%s:%d", caddr, cport);
 	tqpair->qpair.trace_id = spdk_trace_register_owner(OWNER_TYPE_NVMF_TCP, owner);
 	spdk_trace_record(TRACE_TCP_QP_SOCK_INIT, tqpair->qpair.trace_id, 0, 0);
@@ -3486,7 +3479,7 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	}
 	TAILQ_REMOVE(&tgroup->qpairs, tqpair, link);
 
-	/* Try to force out any pending writes */
+	/* Try to force out any pending writes, intentionally do not check rc as it is best effort try. */
 	spdk_sock_flush(tqpair->sock);
 
 	rc = spdk_sock_group_remove_sock(tgroup->sock_group, tqpair->sock);
@@ -3494,6 +3487,8 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 		SPDK_ERRLOG("Could not remove sock from sock_group: %s (%d)\n",
 			    spdk_strerror(errno), errno);
 	}
+
+	nvmf_tcp_abort_await_buffer_reqs(tqpair);
 
 	return rc;
 }

@@ -46,31 +46,19 @@ clean:
 	$(Q)rm -f spdk/version.py
 
 spdk/version.py: $(SPDK_ROOT_DIR)/VERSION
-	$(Q)printf "__version__ = '%d.%d%s'\n" \
+	$(Q)printf "__version__ = '%d.%d%s%s'\n" \
 		$(version_major) $(version_minor) \
+		$(shell [ $(version_patch) != 0 ] && echo -n ".$(version_patch)") \
 		$(shell echo -n \"$(version_suffix)\" | sed 's/-pre/rc0/g' | tr -d -) > spdk/version.py
 
-install: rpc spdkcli
+install:
 	$(Q)$(setup_cmd) $(SPDK_ROOT_DIR)/python
 	rm -rf $(SPDK_ROOT_DIR)/python/spdk.egg-info
 
-$(SPDK_ROOT_DIR)/build/bin/spdk_rpc:
-	cp $(SPDK_ROOT_DIR)/scripts/rpc.py $(SPDK_ROOT_DIR)/build/bin/spdk_rpc
-	chmod +x $(SPDK_ROOT_DIR)/build/bin/spdk_rpc
-
-$(SPDK_ROOT_DIR)/build/bin/spdk_cli:
-	cp $(SPDK_ROOT_DIR)/scripts/spdkcli.py $(SPDK_ROOT_DIR)/build/bin/spdk_cli
-	chmod +x $(SPDK_ROOT_DIR)/build/bin/spdk_cli
-
-rpc: $(SPDK_ROOT_DIR)/build/bin/spdk_rpc
-	$(INSTALL_APP)
-
-spdkcli: $(SPDK_ROOT_DIR)/build/bin/spdk_cli
-	$(INSTALL_APP)
-
 uninstall:
 	$(Q)rm -rf $(DESTDIR)/$(pylibdir)/spdk*
-	$(Q)rm -f $(DESTDIR)/$(bindir)/spdk_rpc
-	$(Q)rm -f $(DESTDIR)/$(bindir)/spdk_cli
+	$(Q)rm -f $(DESTDIR)/$(bindir)/spdk-rpc
+	$(Q)rm -f $(DESTDIR)/$(bindir)/spdk-sma
+	$(Q)rm -f $(DESTDIR)/$(bindir)/spdk-cli
 
 .PHONY: all clean install uninstall

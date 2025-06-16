@@ -19,7 +19,7 @@ try:
 except ImportError:
     from pipes import quote
 
-sys.path.append(os.path.dirname(__file__) + '/../python')
+sys.path.insert(0, os.path.dirname(__file__) + '/../python')
 
 import spdk.rpc as rpc  # noqa
 from spdk.rpc.client import print_dict, print_json, JSONRPCException  # noqa
@@ -260,6 +260,7 @@ def main():
     p.set_defaults(func=bdev_wait_for_examine)
 
     def bdev_compress_create(args):
+        print("bdev_compress_create RPC is deprecated", file=sys.stderr)
         print_json(rpc.bdev.bdev_compress_create(args.client,
                                                  base_bdev_name=args.base_bdev_name,
                                                  pm_path=args.pm_path,
@@ -280,6 +281,7 @@ def main():
     p.set_defaults(func=bdev_compress_create)
 
     def bdev_compress_delete(args):
+        print("bdev_compress_delete RPC is deprecated", file=sys.stderr)
         rpc.bdev.bdev_compress_delete(args.client,
                                       name=args.name)
 
@@ -288,6 +290,7 @@ def main():
     p.set_defaults(func=bdev_compress_delete)
 
     def bdev_compress_get_orphans(args):
+        print("bdev_compress_get_orphans RPC is deprecated", file=sys.stderr)
         print_dict(rpc.bdev.bdev_compress_get_orphans(args.client,
                                                       name=args.name))
     p = subparsers.add_parser(
@@ -597,37 +600,7 @@ def main():
     p.set_defaults(func=bdev_xnvme_delete)
 
     def bdev_nvme_set_options(args):
-        rpc.bdev.bdev_nvme_set_options(args.client,
-                                       action_on_timeout=args.action_on_timeout,
-                                       timeout_us=args.timeout_us,
-                                       timeout_admin_us=args.timeout_admin_us,
-                                       keep_alive_timeout_ms=args.keep_alive_timeout_ms,
-                                       arbitration_burst=args.arbitration_burst,
-                                       low_priority_weight=args.low_priority_weight,
-                                       medium_priority_weight=args.medium_priority_weight,
-                                       high_priority_weight=args.high_priority_weight,
-                                       nvme_adminq_poll_period_us=args.nvme_adminq_poll_period_us,
-                                       nvme_ioq_poll_period_us=args.nvme_ioq_poll_period_us,
-                                       io_queue_requests=args.io_queue_requests,
-                                       delay_cmd_submit=args.delay_cmd_submit,
-                                       transport_retry_count=args.transport_retry_count,
-                                       bdev_retry_count=args.bdev_retry_count,
-                                       transport_ack_timeout=args.transport_ack_timeout,
-                                       ctrlr_loss_timeout_sec=args.ctrlr_loss_timeout_sec,
-                                       reconnect_delay_sec=args.reconnect_delay_sec,
-                                       fast_io_fail_timeout_sec=args.fast_io_fail_timeout_sec,
-                                       disable_auto_failback=args.disable_auto_failback,
-                                       generate_uuids=args.generate_uuids,
-                                       transport_tos=args.transport_tos,
-                                       nvme_error_stat=args.nvme_error_stat,
-                                       rdma_srq_size=args.rdma_srq_size,
-                                       io_path_stat=args.io_path_stat,
-                                       allow_accel_sequence=args.allow_accel_sequence,
-                                       rdma_max_cq_size=args.rdma_max_cq_size,
-                                       rdma_cm_event_timeout_ms=args.rdma_cm_event_timeout_ms,
-                                       dhchap_digests=args.dhchap_digests,
-                                       dhchap_dhgroups=args.dhchap_dhgroups,
-                                       rdma_umr_per_io=args.rdma_umr_per_io)
+        rpc.bdev.bdev_nvme_set_options(**vars(args))
 
     p = subparsers.add_parser('bdev_nvme_set_options',
                               help='Set options for the bdev nvme type. This is startup command.')
@@ -720,6 +693,8 @@ def main():
     p.add_argument('--disable-rdma-umr-per-io',
                    help='''Disable scatter-gather RDMA Memory Region per IO.''',
                    action='store_false', dest='rdma_umr_per_io')
+    p.add_argument('--tcp-connect-timeout-ms',
+                   help='Time to wait until TCP connection is done. Default: 0 (no timeout).', type=int)
 
     p.set_defaults(func=bdev_nvme_set_options)
 
@@ -1121,7 +1096,8 @@ def main():
                                             rbd_name=args.rbd_name,
                                             block_size=args.block_size,
                                             cluster_name=args.cluster_name,
-                                            uuid=args.uuid))
+                                            uuid=args.uuid,
+                                            read_only=args.read_only))
 
     p = subparsers.add_parser('bdev_rbd_create', help='Add a bdev with ceph rbd backend')
     p.add_argument('-b', '--name', help="Name of the bdev")
@@ -1133,6 +1109,7 @@ def main():
     p.add_argument('block_size', help='rbd block size', type=int)
     p.add_argument('-c', '--cluster-name', help="cluster name to identify the Rados cluster")
     p.add_argument('-u', '--uuid', help="UUID of the bdev")
+    p.add_argument("-r", "--readonly", action='store_true', help='Set this bdev as read-only')
     p.set_defaults(func=bdev_rbd_create)
 
     def bdev_rbd_delete(args):
@@ -1303,7 +1280,8 @@ def main():
     p.set_defaults(func=bdev_reset_iostat)
 
     def bdev_enable_histogram(args):
-        rpc.bdev.bdev_enable_histogram(args.client, name=args.name, enable=args.enable, opc=args.opc)
+        rpc.bdev.bdev_enable_histogram(args.client, name=args.name, enable=args.enable, opc=args.opc,
+                                       granularity=args.granularity, min_nsec=args.min_nsec, max_nsec=args.max_nsec)
 
     p = subparsers.add_parser('bdev_enable_histogram',
                               help='Enable or disable histogram for specified bdev')
@@ -1311,6 +1289,9 @@ def main():
     p.add_argument('-d', '--disable', dest='enable', action='store_false', help='Disable histograms on specified device')
     p.add_argument('-o', '--opc', help='Enable histogram for specified io type. Defaults to all io types if not specified.'
                    ' Refer to bdev_get_bdevs RPC for the list of io types.')
+    p.add_argument('--granularity', help='Histogram bucket granularity.', type=int)
+    p.add_argument('--min-nsec', help='Histogram min value in nanoseconds.', type=int)
+    p.add_argument('--max-nsec', help='Histogram max value in nanoseconds.', type=int)
     p.add_argument('name', help='bdev name')
     p.set_defaults(func=bdev_enable_histogram)
 
@@ -1764,7 +1745,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument(
         'tag', help='Portal group tag (unique, integer > 0)', type=int)
     p.add_argument('portal_list', help="""List of portals in host:port format, separated by whitespace
-    Example: '192.168.100.100:3260 192.168.100.100:3261 192.168.100.100:3262""")
+    Example: '192.168.100.100:3260 192.168.100.100:3261 192.168.100.100:3262'""")
     p.add_argument('-p', '--private', help="""Public (false) or private (true) portal group.
     Private portal groups do not have their portals returned by a discovery session. A public
     portal group may optionally specify a redirect portal for non-discovery logins. This redirect
@@ -2652,6 +2633,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('--ack-timeout', help='ACK timeout in milliseconds', type=int)
     p.add_argument('--data-wr-pool-size', help='RDMA data WR pool size. Relevant only for RDMA transport', type=int)
     p.add_argument('--disable-command-passthru', help='Disallow command passthru', action='store_true')
+    p.add_argument('--kas', help="Keep alive support", type=int)
+    p.add_argument('--min-kato', help="The minimum keep alive timeout in milliseconds", type=int)
     p.set_defaults(func=nvmf_create_transport)
 
     def nvmf_get_transports(args):
@@ -3631,6 +3614,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
 
     # blobfs
     def blobfs_detect(args):
+        print("blobfs_detect RPC is deprecated", file=sys.stderr)
         print(rpc.blobfs.blobfs_detect(args.client,
                                        bdev_name=args.bdev_name))
 
@@ -3639,6 +3623,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=blobfs_detect)
 
     def blobfs_create(args):
+        print("blobfs_create RPC is deprecated", file=sys.stderr)
         print(rpc.blobfs.blobfs_create(args.client,
                                        bdev_name=args.bdev_name,
                                        cluster_sz=args.cluster_sz))
@@ -3650,6 +3635,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=blobfs_create)
 
     def blobfs_mount(args):
+        print("blobfs_mount RPC is deprecated", file=sys.stderr)
         print(rpc.blobfs.blobfs_mount(args.client,
                                       bdev_name=args.bdev_name,
                                       mountpoint=args.mountpoint))
@@ -3660,6 +3646,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.set_defaults(func=blobfs_mount)
 
     def blobfs_set_cache_size(args):
+        print("blobfs_set_cache_size RPC is deprecated", file=sys.stderr)
         print(rpc.blobfs.blobfs_set_cache_size(args.client,
                                                size_in_mb=args.size_in_mb))
 

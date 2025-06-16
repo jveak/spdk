@@ -32,7 +32,7 @@ dpdk_pci_init(void)
 	 * Only DPDK in development has additional suffix past minor version.
 	 */
 	if (strlen(release) != 0) {
-		if (year == 24 && month == 11 && minor == 0) {
+		if (year == 25 && month == 7 && minor == 0) {
 			g_dpdk_fn_table = &fn_table_2211;
 			SPDK_NOTICELOG("In-development %s is used. There is no support for it in SPDK. "
 				       "Enabled only for validation.\n", rte_version());
@@ -40,10 +40,9 @@ dpdk_pci_init(void)
 		}
 	}
 
-	/* Anything 25.x or higher is not supported. */
-	if (year >= 25) {
-		SPDK_ERRLOG("DPDK version %d.%02d.%d not supported.\n", year, month, minor);
-		return -EINVAL;
+	/* Anything 26.x or higher is not supported. */
+	if (year >= 26) {
+		goto not_supported;
 	}
 
 	if (year == 22 && month == 11) {
@@ -54,8 +53,7 @@ dpdk_pci_init(void)
 			 * no ABI changes for the minor release, or add new header files and
 			 * pci_dpdk_xxx.c implementation for the new minor release.
 			 */
-			SPDK_ERRLOG("DPDK LTS version 22.11.%d not supported.\n", minor);
-			return -EINVAL;
+			goto not_supported;
 		}
 		g_dpdk_fn_table = &fn_table_2211;
 	} else if (year == 23) {
@@ -63,28 +61,37 @@ dpdk_pci_init(void)
 		if ((month != 11 || minor != 0) &&
 		    (month != 7 || minor != 0) &&
 		    (month != 3 || minor != 0)) {
-			SPDK_ERRLOG("DPDK version 23.%02d.%d is not supported.\n", month, minor);
-			return -EINVAL;
+			goto not_supported;
 		}
 		/* There were no changes between 22.11 and 23.11, so use the 22.11 implementation. */
 		g_dpdk_fn_table = &fn_table_2211;
 	} else if (year == 24) {
-		/* Only 24.03.0 and 24.07.0 are supported. */
-		if ((month != 7 || minor != 0) &&
+		/* Only 24.11.0-2, 24.07.0 and 24.03.0 are supported. */
+		if ((month != 11 || minor > 2) &&
+		    (month != 7 || minor != 0) &&
 		    (month != 3 || minor != 0)) {
-			SPDK_ERRLOG("DPDK version 24.%02d.%d is not supported.\n", month, minor);
-			return -EINVAL;
+			goto not_supported;
 		}
 		/* There were no changes between 22.11 and 24.*, so use the 22.11 implementation. */
 		g_dpdk_fn_table = &fn_table_2211;
+	} else if (year == 25) {
+		/* Only 25.03.0 is supported. */
+		if (month != 3 || minor != 0) {
+			goto not_supported;
+		}
+		/* There were no changes between 22.11 and 25.*, so use the 22.11 implementation. */
+		g_dpdk_fn_table = &fn_table_2211;
 	} else if (year < 21 || (year == 21 && month < 11)) {
-		SPDK_ERRLOG("DPDK version %02d.%02d.%d is not supported.\n", year, month, minor);
-		return -EINVAL;
+		goto not_supported;
 	} else {
 		/* Everything else we use the 22.07 implementation. */
 		g_dpdk_fn_table = &fn_table_2207;
 	}
 	return 0;
+
+not_supported:
+	SPDK_ERRLOG("DPDK version %02d.%02d.%d is not supported.\n", year, month, minor);
+	return -EINVAL;
 }
 
 struct rte_mem_resource *

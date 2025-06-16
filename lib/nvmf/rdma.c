@@ -2545,7 +2545,6 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 		 struct spdk_nvmf_rdma_device **new_device)
 {
 	struct spdk_nvmf_rdma_device	*device;
-	int				flag = 0;
 	int				rc = 0;
 
 	device = calloc(1, sizeof(*device));
@@ -2581,11 +2580,8 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 	}
 #endif
 
-	/* set up device context async ev fd as NON_BLOCKING */
-	flag = fcntl(device->context->async_fd, F_GETFL);
-	rc = fcntl(device->context->async_fd, F_SETFL, flag | O_NONBLOCK);
+	rc = spdk_fd_set_nonblock(device->context->async_fd);
 	if (rc < 0) {
-		SPDK_ERRLOG("Failed to set context async fd to NONBLOCK.\n");
 		free(device);
 		return rc;
 	}
@@ -2678,7 +2674,6 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 	struct ibv_context		**contexts;
 	size_t				data_wr_pool_size;
 	uint32_t			i;
-	int				flag;
 	uint32_t			sge_count;
 	uint32_t			min_shared_buffers;
 	uint32_t			min_in_capsule_data_size;
@@ -2782,10 +2777,7 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 		return NULL;
 	}
 
-	flag = fcntl(rtransport->event_channel->fd, F_GETFL);
-	if (fcntl(rtransport->event_channel->fd, F_SETFL, flag | O_NONBLOCK) < 0) {
-		SPDK_ERRLOG("fcntl can't set nonblocking mode for socket, fd: %d (%s)\n",
-			    rtransport->event_channel->fd, spdk_strerror(errno));
+	if (spdk_fd_set_nonblock(rtransport->event_channel->fd) < 0) {
 		nvmf_rdma_destroy(&rtransport->transport, NULL, NULL);
 		return NULL;
 	}
@@ -3061,7 +3053,7 @@ nvmf_rdma_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_t
 	}
 
 	TAILQ_FOREACH(device, &rtransport->devices, link) {
-		if (device->context == port->id->verbs && device->is_ready) {
+		if (device->context == port->id->verbs && device->is_ready && !device->need_destroy) {
 			port->device = device;
 			break;
 		}
@@ -3473,7 +3465,10 @@ nvmf_rdma_destroy_drained_qpair(struct spdk_nvmf_rdma_qpair *rqpair)
 	struct spdk_nvmf_rdma_transport *rtransport = SPDK_CONTAINEROF(rqpair->qpair.transport,
 			struct spdk_nvmf_rdma_transport, transport);
 
-	nvmf_rdma_qpair_process_pending(rtransport, rqpair, true);
+	if (rqpair->poller) {
+		/* a qpair might be destroyed before being added to a poll group */
+		nvmf_rdma_qpair_process_pending(rtransport, rqpair, true);
+	}
 
 	/* nvmf_rdma_close_qpair is not called */
 	if (!rqpair->to_close) {
@@ -4900,14 +4895,28 @@ static void
 _nvmf_rdma_remove_poller_in_group(void *c)
 {
 	struct poller_manage_ctx		*ctx = c;
+	struct spdk_nvmf_rdma_poller            *rpoller;
 
-	ctx->rpoller->need_destroy = true;
-	ctx->rpoller->destroy_cb_ctx = ctx;
-	ctx->rpoller->destroy_cb = _nvmf_rdma_remove_poller_in_group_cb;
+	/* Check if the poller referred to by this context was already removed.
+	 * If it was already removed, simply call the usual destroy_cb function
+	 * directly.
+	 */
+	TAILQ_FOREACH(rpoller, &ctx->rgroup->pollers, link) {
+		if (rpoller == ctx->rpoller) {
+			break;
+		}
+	}
 
-	/* qp will be disconnected after receiving a RDMA_CM_EVENT_DEVICE_REMOVAL event. */
-	if (RB_EMPTY(&ctx->rpoller->qpairs)) {
-		nvmf_rdma_poller_destroy(ctx->rpoller);
+	if (rpoller != NULL) {
+		rpoller->need_destroy = true;
+		rpoller->destroy_cb_ctx = ctx;
+		rpoller->destroy_cb = _nvmf_rdma_remove_poller_in_group_cb;
+		/* qp will be disconnected after receiving a RDMA_CM_EVENT_DEVICE_REMOVAL event. */
+		if (RB_EMPTY(&ctx->rpoller->qpairs)) {
+			nvmf_rdma_poller_destroy(ctx->rpoller);
+		}
+	} else {
+		_nvmf_rdma_remove_poller_in_group_cb(ctx);
 	}
 }
 
@@ -5033,6 +5042,10 @@ nvmf_rdma_request_set_abort_status(struct spdk_nvmf_request *req,
 {
 	rdma_req_to_abort->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
 	rdma_req_to_abort->req.rsp->nvme_cpl.status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
+	/* Ensure cid is correct in case abort was requested before IO is being executed */
+	rdma_req_to_abort->req.rsp->nvme_cpl.sqid = 0;
+	rdma_req_to_abort->req.rsp->nvme_cpl.status.p = 0;
+	rdma_req_to_abort->req.rsp->nvme_cpl.cid = rdma_req_to_abort->req.cmd->nvme_cmd.cid;
 
 	STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req_to_abort, state_link);
 	rdma_req_to_abort->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;

@@ -18,6 +18,7 @@ extern "C" {
 
 typedef void (*spdk_bdev_nvme_create_cb)(void *ctx, size_t bdev_count, int rc);
 typedef void (*spdk_bdev_nvme_set_multipath_policy_cb)(void *cb_arg, int rc);
+typedef void (*spdk_bdev_nvme_delete_cb)(void *ctx, int rc);
 
 enum spdk_bdev_nvme_multipath_policy {
 	BDEV_NVME_MP_POLICY_ACTIVE_PASSIVE,
@@ -48,6 +49,8 @@ struct spdk_bdev_nvme_ctrlr_opts {
 	/* Set to true if multipath enabled */
 	bool multipath;
 };
+
+struct spdk_nvme_path_id;
 
 enum spdk_bdev_timeout_action {
 	SPDK_BDEV_NVME_TIMEOUT_ACTION_NONE = 0,
@@ -97,11 +100,14 @@ struct spdk_bdev_nvme_opts {
 	uint32_t rdma_srq_size;
 	uint32_t rdma_max_cq_size;
 	uint16_t rdma_cm_event_timeout_ms;
-	/* Hole at byte 110-111. */
+	/* Hole at bytes 110-111. */
 	uint8_t reserved110[2];
 	uint32_t dhchap_digests;
 	uint32_t dhchap_dhgroups;
 	bool rdma_umr_per_io;
+	/* Hole at bytes 121-123. */
+	uint8_t reserved121[3];
+	uint32_t tcp_connect_timeout_ms;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 128, "Incorrect size");
 
@@ -128,6 +134,28 @@ int spdk_bdev_nvme_create(struct spdk_nvme_transport_id *trid,
 			  void *cb_ctx,
 			  struct spdk_nvme_ctrlr_opts *drv_opts,
 			  struct spdk_bdev_nvme_ctrlr_opts *bdev_opts);
+
+/**
+ * Delete the specified NVMe controller, or one of its paths.
+ *
+ * NOTE: When path_id is specified and it is the only path_id associated with NVMe controller
+ * the path is removed and the NVMe controller gets deleted. (Optional) callback
+ * function gets executed on delete complete in caller's thread. When the (optional)
+ * callback is not provided, the control is returned back at the time delete is initiated,
+ * not when it is completed. When NVMe controller deletion is already in progress state,
+ * this function returns success.
+ *
+ * \param name NVMe controller name.
+ * \param path_id The specified path to remove (optional).
+ * \param delete_cb	Callback function on delete complete (optional).
+ * \param cb_ctx Context passed to callback (optional).
+ * \return zero on success,
+ *		-EINVAL on wrong parameters or
+ *		-ENODEV if controller is not found or
+ *		-ENOMEM on no memory
+ */
+int spdk_bdev_nvme_delete(const char *name, const struct spdk_nvme_path_id *path_id,
+			  spdk_bdev_nvme_delete_cb delete_cb, void *cb_ctx);
 
 /**
  * Set multipath policy of the NVMe bdev.

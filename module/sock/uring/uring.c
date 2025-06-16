@@ -19,12 +19,10 @@
 #include "spdk/net.h"
 #include "spdk/file.h"
 
-#include "spdk_internal/sock.h"
+#include "spdk_internal/sock_module.h"
 #include "spdk_internal/assert.h"
 #include "spdk/net.h"
 
-#define MAX_TMPBUF 1024
-#define PORTNUMLEN 32
 #define SPDK_SOCK_GROUP_QUEUE_DEPTH 4096
 #define SPDK_SOCK_CMG_INFO_SIZE (sizeof(struct cmsghdr) + sizeof(struct sock_extended_err))
 
@@ -457,6 +455,9 @@ uring_sock_alloc(int fd, struct spdk_sock_impl_opts *impl_opts, bool enable_zero
 		if (rc == 0) {
 			sock->zcopy = true;
 			sock->zcopy_send_flags = MSG_ZEROCOPY;
+			/* Zcopy notification index from the kernel for first sendmsg is 0, so we need to start
+			 * incrementing internal counter from UINT32_MAX. */
+			sock->sendmsg_idx = UINT32_MAX;
 		}
 	}
 #endif
@@ -472,43 +473,16 @@ uring_sock_create(const char *ip, int port,
 {
 	struct spdk_uring_sock *sock;
 	struct spdk_sock_impl_opts impl_opts;
-	char buf[MAX_TMPBUF];
-	char portnum[PORTNUMLEN];
-	char *p;
-	const char *src_addr;
-	uint16_t src_port;
-	struct addrinfo hints, *res, *res0, *src_ai;
-	int fd, flag;
-	int val = 1;
-	int rc;
+	struct addrinfo *res, *res0;
+	int fd, rc;
 	bool enable_zcopy_impl_opts = false;
 	bool enable_zcopy_user_opts = true;
 
 	assert(opts != NULL);
 	uring_opts_get_impl_opts(opts, &impl_opts);
 
-	if (ip == NULL) {
-		return NULL;
-	}
-	if (ip[0] == '[') {
-		snprintf(buf, sizeof(buf), "%s", ip + 1);
-		p = strchr(buf, ']');
-		if (p != NULL) {
-			*p = '\0';
-		}
-		ip = (const char *) &buf[0];
-	}
-
-	snprintf(portnum, sizeof portnum, "%d", port);
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = PF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_NUMERICSERV;
-	hints.ai_flags |= AI_PASSIVE;
-	hints.ai_flags |= AI_NUMERICHOST;
-	rc = getaddrinfo(ip, portnum, &hints, &res0);
-	if (rc != 0) {
-		SPDK_ERRLOG("getaddrinfo() failed %s (%d)\n", gai_strerror(rc), rc);
+	res0 = spdk_sock_posix_getaddrinfo(ip, port);
+	if (!res0) {
 		return NULL;
 	}
 
@@ -516,75 +490,9 @@ uring_sock_create(const char *ip, int port,
 	fd = -1;
 	for (res = res0; res != NULL; res = res->ai_next) {
 retry:
-		fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+		fd = spdk_sock_posix_fd_create(res, opts, &impl_opts);
 		if (fd < 0) {
-			/* error */
 			continue;
-		}
-
-		val = impl_opts.recv_buf_size;
-		rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &val, sizeof val);
-		if (rc) {
-			/* Not fatal */
-		}
-
-		val = impl_opts.send_buf_size;
-		rc = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof val);
-		if (rc) {
-			/* Not fatal */
-		}
-
-		rc = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof val);
-		if (rc != 0) {
-			close(fd);
-			fd = -1;
-			/* error */
-			continue;
-		}
-		rc = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof val);
-		if (rc != 0) {
-			close(fd);
-			fd = -1;
-			/* error */
-			continue;
-		}
-
-		if (opts->ack_timeout) {
-#if defined(__linux__)
-			val = opts->ack_timeout;
-			rc = setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &val, sizeof val);
-			if (rc != 0) {
-				close(fd);
-				fd = -1;
-				/* error */
-				continue;
-			}
-#else
-			SPDK_WARNLOG("TCP_USER_TIMEOUT is not supported.\n");
-#endif
-		}
-
-
-
-#if defined(SO_PRIORITY)
-		if (opts != NULL && opts->priority) {
-			rc = setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &opts->priority, sizeof val);
-			if (rc != 0) {
-				close(fd);
-				fd = -1;
-				/* error */
-				continue;
-			}
-		}
-#endif
-		if (res->ai_family == AF_INET6) {
-			rc = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof val);
-			if (rc != 0) {
-				close(fd);
-				fd = -1;
-				/* error */
-				continue;
-			}
 		}
 
 		if (type == SPDK_SOCK_CREATE_LISTEN) {
@@ -618,9 +526,7 @@ retry:
 				break;
 			}
 
-			flag = fcntl(fd, F_GETFL);
-			if (fcntl(fd, F_SETFL, flag | O_NONBLOCK) < 0) {
-				SPDK_ERRLOG("fcntl can't set nonblocking mode for socket, fd: %d (%d)\n", fd, errno);
+			if (spdk_fd_set_nonblock(fd) < 0) {
 				close(fd);
 				fd = -1;
 				break;
@@ -628,49 +534,18 @@ retry:
 
 			enable_zcopy_impl_opts = impl_opts.enable_zerocopy_send_server;
 		} else if (type == SPDK_SOCK_CREATE_CONNECT) {
-			src_addr = SPDK_GET_FIELD(opts, src_addr, NULL, opts->opts_size);
-			src_port = SPDK_GET_FIELD(opts, src_port, 0, opts->opts_size);
-			if (src_addr != NULL || src_port != 0) {
-				snprintf(portnum, sizeof(portnum), "%"PRIu16, src_port);
-				memset(&hints, 0, sizeof hints);
-				hints.ai_family = AF_UNSPEC;
-				hints.ai_socktype = SOCK_STREAM;
-				hints.ai_flags = AI_NUMERICSERV | AI_NUMERICHOST | AI_PASSIVE;
-				rc = getaddrinfo(src_addr, src_port > 0 ? portnum : NULL,
-						 &hints, &src_ai);
-				if (rc != 0 || src_ai == NULL) {
-					SPDK_ERRLOG("getaddrinfo() failed %s (%d)\n",
-						    rc != 0 ? gai_strerror(rc) : "", rc);
-					close(fd);
-					fd = -1;
-					break;
-				}
-				rc = bind(fd, src_ai->ai_addr, src_ai->ai_addrlen);
-				if (rc != 0) {
-					SPDK_ERRLOG("bind() failed errno %d (%s:%s)\n", errno,
-						    src_addr ? src_addr : "", portnum);
-					close(fd);
-					fd = -1;
-					freeaddrinfo(src_ai);
-					src_ai = NULL;
-					break;
-				}
-				freeaddrinfo(src_ai);
-				src_ai = NULL;
-			}
-
-			rc = connect(fd, res->ai_addr, res->ai_addrlen);
+			rc = spdk_sock_posix_fd_connect(fd, res, opts);
 			if (rc != 0) {
-				SPDK_ERRLOG("connect() failed, errno = %d\n", errno);
-				/* try next family */
 				close(fd);
 				fd = -1;
-				continue;
+				if (rc == 1) {
+					continue;
+				} else {
+					break;
+				}
 			}
 
-			flag = fcntl(fd, F_GETFL);
-			if (fcntl(fd, F_SETFL, flag & ~O_NONBLOCK) < 0) {
-				SPDK_ERRLOG("fcntl can't set blocking mode for socket, fd: %d (%d)\n", fd, errno);
+			if (spdk_fd_clear_nonblock(fd) < 0) {
 				close(fd);
 				fd = -1;
 				break;
@@ -727,7 +602,6 @@ uring_sock_accept(struct spdk_sock *_sock)
 	socklen_t			salen;
 	int				rc, fd;
 	struct spdk_uring_sock		*new_sock;
-	int				flag;
 
 	memset(&sa, 0, sizeof(sa));
 	salen = sizeof(sa);
@@ -742,9 +616,7 @@ uring_sock_accept(struct spdk_sock *_sock)
 
 	fd = rc;
 
-	flag = fcntl(fd, F_GETFL);
-	if ((flag & O_NONBLOCK) && (fcntl(fd, F_SETFL, flag & ~O_NONBLOCK) < 0)) {
-		SPDK_ERRLOG("fcntl can't set blocking mode for socket, fd: %d (%d)\n", fd, errno);
+	if (spdk_fd_clear_nonblock(fd) < 0) {
 		close(fd);
 		return NULL;
 	}
@@ -1097,8 +969,12 @@ sock_complete_write_reqs(struct spdk_sock *_sock, ssize_t rc, bool is_zcopy)
 	/* Consume the requests that were actually written */
 	req = TAILQ_FIRST(&_sock->queued_reqs);
 	while (req) {
-		/* req->internal.is_zcopy is true when the whole req or part of it is sent with zerocopy */
-		req->internal.is_zcopy = is_zcopy;
+		if (is_zcopy) {
+			/* Cache sendmsg_idx because full request might not be handled and next
+			 * chunk may be sent without zero copy. */
+			req->internal.pending_zcopy = true;
+			req->internal.zcopy_idx = sock->sendmsg_idx;
+		}
 
 		rc = sock_request_advance_offset(req, rc);
 		if (rc < 0) {
@@ -1109,16 +985,12 @@ sock_complete_write_reqs(struct spdk_sock *_sock, ssize_t rc, bool is_zcopy)
 		/* Handled a full request. */
 		spdk_sock_request_pend(_sock, req);
 
-		if (!req->internal.is_zcopy && req == TAILQ_FIRST(&_sock->pending_reqs)) {
+		if (!req->internal.pending_zcopy &&
+		    req == TAILQ_FIRST(&_sock->pending_reqs)) {
 			retval = spdk_sock_request_put(_sock, req, 0);
 			if (retval) {
 				return retval;
 			}
-		} else {
-			/* Re-use the offset field to hold the sendmsg call index. The
-			 * index is 0 based, so subtract one here because we've already
-			 * incremented above. */
-			req->internal.offset = sock->sendmsg_idx - 1;
 		}
 
 		if (rc == 0) {
@@ -1178,13 +1050,14 @@ _sock_check_zcopy(struct spdk_sock *_sock, int status)
 	while (true) {
 		found = false;
 		TAILQ_FOREACH_SAFE(req, &_sock->pending_reqs, internal.link, treq) {
-			if (!req->internal.is_zcopy) {
-				/* This wasn't a zcopy request. It was just waiting in line to complete */
+			if (!req->internal.pending_zcopy) {
+				/* This wasn't a zcopy request. It was just waiting in line
+				 * to complete. */
 				rc = spdk_sock_request_put(_sock, req, 0);
 				if (rc < 0) {
 					return rc;
 				}
-			} else if (req->internal.offset == idx) {
+			} else if (req->internal.zcopy_idx == idx) {
 				found = true;
 				rc = spdk_sock_request_put(_sock, req, 0);
 				if (rc < 0) {
@@ -1200,6 +1073,17 @@ _sock_check_zcopy(struct spdk_sock *_sock, int status)
 		}
 
 		idx++;
+	}
+
+	/* If the req is sent partially (still queued) and we just received its zcopy
+	 * notification, next chunk may be sent without zcopy and should result in the req
+	 * completion if it is the last chunk. Clear the pending flag to allow it.
+	 * Checking the first queued req and the last index is enough, because only one req
+	 * can be partially sent and it is the last one we can get notification for. */
+	req = TAILQ_FIRST(&_sock->queued_reqs);
+	if (req && req->internal.pending_zcopy &&
+	    req->internal.zcopy_idx == serr->ee_data) {
+		req->internal.pending_zcopy = false;
 	}
 
 	return 0;
@@ -1401,7 +1285,7 @@ sock_uring_group_reap(struct spdk_uring_sock_group_impl *group, int max, int max
 				tracker = &group->trackers[bid];
 
 				assert(tracker->buf != NULL);
-				assert(tracker->len != 0);
+				assert(tracker->buflen != 0);
 
 				/* Append this data to the stream */
 				tracker->len = status;
@@ -2026,14 +1910,14 @@ uring_sock_flush(struct spdk_sock *_sock)
 		retval = recvmsg(sock->fd, &task->msg, MSG_ERRQUEUE);
 		if (retval < 0) {
 			if (errno == EWOULDBLOCK || errno == EAGAIN) {
-				return rc;
+				return 0;
 			}
 		}
 		_sock_check_zcopy(_sock, retval);;
 	}
 #endif
 
-	return rc;
+	return 0;
 }
 
 static int

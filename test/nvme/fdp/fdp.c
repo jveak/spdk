@@ -5,6 +5,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/nvme.h"
+#include "spdk_internal/nvme_util.h"
 #include "spdk/env.h"
 #include "spdk/util.h"
 
@@ -970,16 +971,8 @@ usage(const char *program_name)
 	printf("%s [options]", program_name);
 	printf("\n");
 	printf("options:\n");
-	printf(" -r trid    remote NVMe over Fabrics target address\n");
-	printf("    Format: 'key:value [key:value] ...'\n");
-	printf("    Keys:\n");
-	printf("     trtype      Transport type (e.g. RDMA)\n");
-	printf("     adrfam      Address family (e.g. IPv4, IPv6)\n");
-	printf("     traddr      Transport address (e.g. 192.168.100.8)\n");
-	printf("     trsvcid     Transport service identifier (e.g. 4420)\n");
-	printf("     subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
-	printf("    Example: -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420'\n");
-	printf(" -h         show this usage\n");
+	spdk_nvme_transport_id_usage(stdout, 0);
+	printf("\t-h         show this usage\n");
 }
 
 static int

@@ -1,28 +1,96 @@
 # Changelog
 
-## v25.01: (Upcoming Release)
+## v25.09: (Upcoming Release)
+
+### sock
+
+Simplified spdk_sock_[listen|connect] impl_name handling. Previously, if NULL was provided and the
+connection or listen operation failed the code would continue checking other sock implementations.
+This behavior is no longer necessary, as VPP sock module was removed. The remaining uring and posix
+implementations both rely on network kernel stack and upcoming XLIO support shares the same
+addressing. This legacy behavior complicates the implementation of asynchronous connect,
+particularly when the socket object is returned immediately. Now, when NULL is provided, the default
+implementation is selected and terminates on failure without iterating over other sock
+implementations.
+
+Changed the return behavior of `spdk_sock_flush`. The function now returns 0 on success, as relying
+on the number of bytes returned was not recommended.
+
+## v25.05
+
+### accel_mlx5
+
+Added mlx5 platform driver capable of executing sequences of RDMA + crypto operations in one go.  It
+utilizes UMR (User Memory Region) registration, which allows changing properties of memory keys,
+which are then used by the NIC to perform the offload (e.g. encrypt/decrypt) while doing
+RDMA_READ/RDMA_WRITE operations.
+
+### bdev
+
+Added capability to insert/strip DIF from IOs in the bdev layer.  This allows users to to rely on
+the bdev layer to generate and verify the integrity of the data.
+
+Added support for inserting or overwriting metadata buffers depending on the NVMe PRACT bits set in
+`spdk_bdev_ext_io_opts`.
+
+Added `spdk_bdev_open_ext_v2()` API allowing for more flexible additions of per-open options.
+
+Added APIs to retrieve metadata configuration depending on the `hide_metadata` option.
+
+Added option to reset stats in `bdev_get_iostat` RPC.
+
+Added option to specify the granularity and min/max values when enabling histogram for a bdev.  It
+allows users to reduce the size of the histogram.
+
+### bdev_compress
+
+Added support for UNMAP.
 
 ### bdev_nvme
 
 Added controller configuration consistency check, so all controllers created with the same name will
-be forced to have consistent setting, either multipath or failover. No mixing of different '-x'
+be forced to have consistent setting, either multipath or failover. No mixing of different `-x`
 options will be allowed.
 
-Changed default mode: if no '-x' option is specified in bdev_nvme_attach_controller RPC call,
+Changed default mode: if no `-x` option is specified in `bdev_nvme_attach_controller` RPC call,
 the multipath mode will be assigned as a default.
 
-Changed `spdk_bdev_nvme_create` API function, the `multipath` parameter was removed as it is redundant
-to `multipath` field in spdk_bdev_nvme_ctrlr_opts structure passed as a parameter to this function.
-If multipathing shall be enabled for nvme bdev, `bdev_opts.multipath` shall be set to `true`. When
+Changed `spdk_bdev_nvme_create` API function, the `multipath` parameter was removed as it is
+redundant to `multipath` field in `spdk_bdev_nvme_ctrlr_opts` structure passed as a parameter to
+this function.  To enable multipath, `bdev_opts.multipath` must be set to `true`.  When
 `bdev_opts.multipath` is set to `false`, failover mode is enabled.
 
 Added public APIs `spdk_bdev_nvme_get_opts` and `spdk_bdev_nvme_set_opts` to get default bdev nvme
 options and set them respectively.
 
+Added public API `spdk_bdev_nvme_delete` to delete the specified NVMe controller or one of its paths.
+
+### blobstore
+
+Added support for variable metadata page size.
+
 ### env
 
 Added 3 APIs to handle multiple interrupts for PCI device `spdk_pci_device_enable_interrupts()`,
 `spdk_pci_device_disable_interrupts()`, and `spdk_pci_device_get_interrupt_efd_by_index()`.
+
+Added `spdk_mem_get_numa_id()` API returning the NUMA node ID for the specified memory buffer.
+
+### fsdev
+
+Added `spdk_fsdev_mount()` and `spdk_fsdev_umount()` APIs, fsdev's equivalent of `FUSE_INIT` and
+`FUSE_DESTROY`.  Removed `open_opts` parameter from `spdk_fsdev_open()`, as these options are part
+of `spdk_fsdev_mount_opts`.
+
+### fsdev_aio
+
+Added option to skip read/write operations.  When enabled, `fsdev_aio` works similarly to
+`bdev_null` and immediately completes IOs without actually executing them.  This option only changes
+the behavior of READ and WRITE operations.
+
+### log
+
+Added `spdk_log_open_ext` API allowing users to set custom open and close callbacks.
 
 ### nvme
 
@@ -45,28 +113,66 @@ Two new APIs have been added to manage interrupt events in poll group.
 `spdk_nvme_poll_group_get_fd()` retrieves the internal epoll file descriptor of the poll group.
 
 `spdk_nvme_poll_group_wait()` waits for interrupt events on all the I/O queue pair file descriptors
-in a poll group. When an interrupt event gets generated, it processes any outstanding completions
-on the I/O queue pair with interrupts. These interrupt events are registered at the the time of I/O
-queue pair creation.
+in a poll group. When an interrupt event gets generated, it processes any outstanding completions on
+the I/O queue pair with interrupts. These interrupt events are registered at the time of I/O queue
+pair creation.
+
+Added `spdk_nvme_ctrlr_get_id` function returning the ID of the NVMe controller.
+
+Added `spdk_nvme_poll_group_get_fd_group()` API returning `fd_group` associated with an NVMe poll
+group.
+
+Added `spdk_nvme_poll_group_set_interrupt_callback()` API allowing users to register a callback to
+be executed to handle events associated with qpair connection status.
 
 ### nvmf
 
 Added public API `spdk_nvmf_send_discovery_log_notice` to send discovery log page
 change notice to client.
 
+Added `kas` in `spdk_nvmf_transport_opts` struct. This field indicates the granularity of the
+KATO (Keep Alive Timeout) in 100 millisecond units, and this field cannot be set to 0 to disable
+the Keep Alive Timer feature.
+
+Added `min_kato` in `spdk_nvmf_transport_opts` struct to set the minimum keep alive timeout value
+in milliseconds.
+
+Added `hide_metadata` option to `nvmf_subsystem_add_ns` RPC controlling the corresponding bdev's
+`hide_metadata` option.
+
+### python
+
+Renamed python binaries with `-` instead of `_` spdk-rpc, spdk-sma and spdk-cli to be more platform
+independent for Linux/Windows according to PyPI and hatch suggestions.
+
 ### reduce
 
-Add `spdk_reduce_vol_get_info()` to get the information for the compressed volume.
+Added `spdk_reduce_vol_get_info()` to get the information for the compressed volume.
+
+### sock
+
+A new internal field was added to `spdk_sock_request`, increasing its size and moving `iovcnt` and
+user provided `iov[]` offsets by 8 bytes, which breaks ABI.
 
 ### thread
 
 Added `spdk_interrupt_register_ext()` API which can receive `spdk_event_handler_opts` structure.
 This is to prevent any further expansion of `spdk_interrupt_register()` API.
 
+Added `spdk_thread_register_post_poller_handler()` API to register a post poller handler.  It aims
+at improving doorbell management by ensuring that a doorbell is rang after submitting all requests,
+without waiting for the next poll cycle.
+
+Added support for `fd_group`-based interrupts.  `spdk_interrupt_register_fd_group()` can be used to
+register an interrupt listening on events from an `fd_group`.
+
 ### util
 
 Added `spdk_fd_group_add_ext()` API which can receive `spdk_event_handler_opts` structure. This is
 to prevent any further expansion of `spdk_fd_group_add()` API.
+
+Added `spdk_fd_group_set_wrapper()` API allowing users to set a callback to be executed when an
+event is triggered prior to executing a callback associated with that event.
 
 ## v24.09
 

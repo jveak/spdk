@@ -13,6 +13,8 @@
 #include "nvme/nvme_internal.h"
 #include "common/lib/nvme/common_stubs.h"
 
+struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts = {};
+
 /* nvme_transport_ctrlr_disconnect_qpair_done() stub is defined in common_stubs.h, but we need to
  * override it here */
 static void nvme_transport_ctrlr_disconnect_qpair_done_mocked(struct spdk_nvme_qpair *qpair);
@@ -1487,18 +1489,17 @@ test_nvme_tcp_ctrlr_disconnect_qpair(void)
 	qpair = &tqpair.qpair;
 	qpair->poll_group = &tgroup.group;
 	tqpair.sock = (struct spdk_sock *)0xDEADBEEF;
-	tqpair.needs_poll = true;
 	TAILQ_INIT(&tgroup.needs_poll);
 	STAILQ_INIT(&tgroup.group.disconnected_qpairs);
 	TAILQ_INIT(&tqpair.send_queue);
 	TAILQ_INIT(&tqpair.free_reqs);
 	TAILQ_INIT(&tqpair.outstanding_reqs);
-	TAILQ_INSERT_TAIL(&tgroup.needs_poll, &tqpair, link);
+	TAILQ_INSERT_TAIL(&tgroup.needs_poll, &tqpair, link_poll);
 	TAILQ_INSERT_TAIL(&tqpair.send_queue, &pdu, tailq);
 
 	nvme_tcp_ctrlr_disconnect_qpair(&ctrlr, qpair);
 
-	CU_ASSERT(tqpair.needs_poll == false);
+	CU_ASSERT(TAILQ_ENTRY_NOT_ENQUEUED(&tqpair, link_poll));
 	CU_ASSERT(tqpair.sock == NULL);
 	CU_ASSERT(TAILQ_EMPTY(&tqpair.send_queue) == true);
 

@@ -68,6 +68,7 @@ struct nvme_tcp_poll_group {
 	int64_t num_completions;
 
 	TAILQ_HEAD(, nvme_tcp_qpair) needs_poll;
+	TAILQ_HEAD(, nvme_tcp_qpair) timeout_enabled;
 	struct spdk_nvme_tcp_stat stats;
 };
 
@@ -108,8 +109,9 @@ struct nvme_tcp_qpair {
 
 	enum nvme_tcp_qpair_state		state;
 
-	TAILQ_ENTRY(nvme_tcp_qpair)		link;
-	bool					needs_poll;
+	TAILQ_ENTRY(nvme_tcp_qpair)		link_poll;
+
+	TAILQ_ENTRY(nvme_tcp_qpair)		link_timeout;
 
 	uint64_t				icreq_timeout_tsc;
 
@@ -345,10 +347,9 @@ nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	int rc;
 	struct nvme_tcp_poll_group *group;
 
-	if (tqpair->needs_poll) {
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll)) {
 		group = nvme_tcp_poll_group(qpair->poll_group);
-		TAILQ_REMOVE(&group->needs_poll, tqpair, link);
-		tqpair->needs_poll = false;
+		TAILQ_REMOVE_CLEAR(&group->needs_poll, tqpair, link_poll);
 	}
 
 	rc = spdk_sock_close(&tqpair->sock);
@@ -439,7 +440,7 @@ nvme_tcp_cond_schedule_qpair_polling(struct nvme_tcp_qpair *tqpair)
 {
 	struct nvme_tcp_poll_group *pgroup;
 
-	if (tqpair->needs_poll || !tqpair->qpair.poll_group) {
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll) || !tqpair->qpair.poll_group) {
 		return;
 	}
 
@@ -450,8 +451,7 @@ nvme_tcp_cond_schedule_qpair_polling(struct nvme_tcp_qpair *tqpair)
 	}
 
 	pgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
-	TAILQ_INSERT_TAIL(&pgroup->needs_poll, tqpair, link);
-	tqpair->needs_poll = true;
+	TAILQ_INSERT_TAIL(&pgroup->needs_poll, tqpair, link_poll);
 }
 
 static void
@@ -984,6 +984,15 @@ nvme_tcp_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 			  (uint32_t)req->cmd.cid, (uint32_t)req->cmd.opc,
 			  req->cmd.cdw10, req->cmd.cdw11, req->cmd.cdw12, tqpair->qpair.queue_depth);
 	TAILQ_INSERT_TAIL(&tqpair->outstanding_reqs, tcp_req, link);
+
+	if (TAILQ_ENTRY_NOT_ENQUEUED(tqpair, link_timeout) && qpair->poll_group != NULL &&
+	    qpair->ctrlr->timeout_enabled) {
+		struct nvme_tcp_poll_group *tgroup;
+
+		tgroup = nvme_tcp_poll_group(qpair->poll_group);
+		TAILQ_INSERT_TAIL(&tgroup->timeout_enabled, tqpair, link_timeout);
+	}
+
 	return nvme_tcp_qpair_capsule_cmd_send(tqpair, tcp_req);
 }
 
@@ -1033,6 +1042,17 @@ nvme_tcp_req_complete(struct nvme_tcp_req *tcp_req,
 	spdk_trace_record(TRACE_NVME_TCP_COMPLETE, qpair->id, 0, (uintptr_t)tcp_req->pdu, req->cb_arg,
 			  (uint32_t)req->cmd.cid, (uint32_t)cpl.status_raw, qpair->queue_depth);
 	TAILQ_REMOVE(&tqpair->outstanding_reqs, tcp_req, link);
+
+	if (TAILQ_EMPTY(&tqpair->outstanding_reqs) && qpair->poll_group != NULL &&
+	    TAILQ_ENTRY_ENQUEUED(tqpair, link_timeout)) {
+		struct nvme_tcp_poll_group *tgroup;
+
+		assert(qpair->ctrlr->timeout_enabled);
+
+		tgroup = nvme_tcp_poll_group(qpair->poll_group);
+		TAILQ_REMOVE_CLEAR(&tgroup->timeout_enabled, tqpair, link_timeout);
+	}
+
 	nvme_tcp_req_put(tqpair, tcp_req);
 	nvme_complete_request(req->cb_fn, req->cb_arg, req->qpair, req, &cpl);
 }
@@ -2036,30 +2056,30 @@ nvme_tcp_qpair_check_timeout(struct spdk_nvme_qpair *qpair)
 	struct spdk_nvme_ctrlr_process *active_proc;
 
 	/* Don't check timeouts during controller initialization. */
-	if (ctrlr->state != NVME_CTRLR_STATE_READY) {
+	if (spdk_unlikely(ctrlr->state != NVME_CTRLR_STATE_READY)) {
 		return;
 	}
 
-	if (nvme_qpair_is_admin_queue(qpair)) {
+	if (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {
 		active_proc = nvme_ctrlr_get_current_process(ctrlr);
 	} else {
 		active_proc = qpair->active_proc;
 	}
 
 	/* Only check timeouts if the current process has a timeout callback. */
-	if (active_proc == NULL || active_proc->timeout_cb_fn == NULL) {
+	if (spdk_unlikely(active_proc == NULL || active_proc->timeout_cb_fn == NULL)) {
 		return;
 	}
 
 	t02 = spdk_get_ticks();
 	TAILQ_FOREACH_SAFE(tcp_req, &tqpair->outstanding_reqs, link, tmp) {
-		if (ctrlr->is_failed) {
+		if (spdk_unlikely(ctrlr->is_failed)) {
 			/* The controller state may be changed to failed in one of the nvme_request_check_timeout callbacks. */
 			return;
 		}
 		assert(tcp_req->req != NULL);
 
-		if (nvme_request_check_timeout(tcp_req->req, tcp_req->cid, active_proc, t02)) {
+		if (spdk_likely(nvme_request_check_timeout(tcp_req->req, tcp_req->cid, active_proc, t02))) {
 			/*
 			 * The requests are in order, so as soon as one has not timed out,
 			 * stop iterating.
@@ -2080,14 +2100,14 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
 	int rc;
 
 	if (qpair->poll_group == NULL) {
+		if (qpair->ctrlr->timeout_enabled) {
+			nvme_tcp_qpair_check_timeout(qpair);
+		}
+
 		rc = spdk_sock_flush(tqpair->sock);
 		if (rc < 0 && errno != EAGAIN) {
 			SPDK_ERRLOG("Failed to flush tqpair=%p (%d): %s\n", tqpair,
 				    errno, spdk_strerror(errno));
-			if (spdk_unlikely(tqpair->qpair.ctrlr->timeout_enabled)) {
-				nvme_tcp_qpair_check_timeout(qpair);
-			}
-
 			if (nvme_qpair_get_state(qpair) == NVME_QPAIR_DISCONNECTING) {
 				if (TAILQ_EMPTY(&tqpair->outstanding_reqs)) {
 					nvme_transport_ctrlr_disconnect_qpair_done(qpair);
@@ -2113,10 +2133,6 @@ nvme_tcp_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_c
 		SPDK_DEBUGLOG(nvme, "Error polling CQ! (%d): %s\n",
 			      errno, spdk_strerror(errno));
 		goto fail;
-	}
-
-	if (spdk_unlikely(tqpair->qpair.ctrlr->timeout_enabled)) {
-		nvme_tcp_qpair_check_timeout(qpair);
 	}
 
 	if (spdk_unlikely(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING)) {
@@ -2163,9 +2179,8 @@ nvme_tcp_qpair_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_soc
 	int32_t num_completions;
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 
-	if (tqpair->needs_poll) {
-		TAILQ_REMOVE(&pgroup->needs_poll, tqpair, link);
-		tqpair->needs_poll = false;
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll)) {
+		TAILQ_REMOVE_CLEAR(&pgroup->needs_poll, tqpair, link_poll);
 	}
 
 	num_completions = spdk_nvme_qpair_process_completions(qpair, pgroup->completions_per_qpair);
@@ -2279,6 +2294,9 @@ nvme_tcp_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpai
 	if (ctrlr->opts.transport_ack_timeout) {
 		opts.ack_timeout = 1ULL << ctrlr->opts.transport_ack_timeout;
 	}
+
+	opts.connect_timeout = g_spdk_nvme_transport_opts.tcp_connect_timeout_ms;
+
 	if (sock_impl_name) {
 		opts.impl_opts = &impl_opts;
 		opts.impl_opts_size = sizeof(impl_opts);
@@ -2716,6 +2734,7 @@ nvme_tcp_poll_group_create(void)
 	}
 
 	TAILQ_INIT(&group->needs_poll);
+	TAILQ_INIT(&group->timeout_enabled);
 
 	group->sock_group = spdk_sock_group_create(group);
 	if (group->sock_group == NULL) {
@@ -2760,9 +2779,8 @@ nvme_tcp_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair)
 	struct nvme_tcp_poll_group *group = nvme_tcp_poll_group(qpair->poll_group);
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 
-	if (tqpair->needs_poll) {
-		TAILQ_REMOVE(&group->needs_poll, tqpair, link);
-		tqpair->needs_poll = false;
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll)) {
+		TAILQ_REMOVE_CLEAR(&group->needs_poll, tqpair, link_poll);
 	}
 
 	if (tqpair->sock && group->sock_group) {
@@ -2805,9 +2823,11 @@ nvme_tcp_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 	assert(tqpair->shared_stats == true);
 	tqpair->stats = &g_dummy_stats;
 
-	if (tqpair->needs_poll) {
-		TAILQ_REMOVE(&group->needs_poll, tqpair, link);
-		tqpair->needs_poll = false;
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_poll)) {
+		TAILQ_REMOVE_CLEAR(&group->needs_poll, tqpair, link_poll);
+	}
+	if (TAILQ_ENTRY_ENQUEUED(tqpair, link_timeout)) {
+		TAILQ_REMOVE_CLEAR(&group->timeout_enabled, tqpair, link_timeout);
 	}
 
 	return 0;
@@ -2845,8 +2865,14 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 
 	/* If any qpairs were marked as needing to be polled due to an asynchronous write completion
 	 * and they weren't polled as a consequence of calling spdk_sock_group_poll above, poll them now. */
-	TAILQ_FOREACH_SAFE(tqpair, &group->needs_poll, link, tmp_tqpair) {
+	TAILQ_FOREACH_SAFE(tqpair, &group->needs_poll, link_poll, tmp_tqpair) {
 		nvme_tcp_qpair_sock_cb(&tqpair->qpair, group->sock_group, tqpair->sock);
+	}
+
+	TAILQ_FOREACH_SAFE(tqpair, &group->timeout_enabled, link_timeout, tmp_tqpair) {
+		qpair = &tqpair->qpair;
+		assert(qpair->ctrlr->timeout_enabled);
+		nvme_tcp_qpair_check_timeout(qpair);
 	}
 
 	if (spdk_unlikely(num_events < 0)) {

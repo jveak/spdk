@@ -240,6 +240,7 @@ struct nvme_rdma_qpair {
 
 	uint8_t					stale_conn_retry_count;
 	bool					need_destroy;
+	bool					connected;
 	TAILQ_ENTRY(nvme_rdma_qpair)		link_connecting;
 };
 
@@ -452,6 +453,7 @@ nvme_rdma_qpair_process_cm_event(struct nvme_rdma_qpair *rqpair)
 			rc = spdk_rdma_provider_qp_complete_connect(rqpair->rdma_qp);
 		/* fall through */
 		case RDMA_CM_EVENT_ESTABLISHED:
+			rqpair->connected = true;
 			accept_data = (struct spdk_nvmf_rdma_accept_private_data *)event->param.conn.private_data;
 			if (accept_data == NULL) {
 				rc = -1;
@@ -461,6 +463,7 @@ nvme_rdma_qpair_process_cm_event(struct nvme_rdma_qpair *rqpair)
 			}
 			break;
 		case RDMA_CM_EVENT_DISCONNECTED:
+			rqpair->connected = false;
 			rqpair->qpair.transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_REMOTE;
 			break;
 		case RDMA_CM_EVENT_DEVICE_REMOVAL:
@@ -1277,7 +1280,7 @@ nvme_rdma_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qp
 
 	rqpair->state = NVME_RDMA_QPAIR_STATE_INITIALIZING;
 
-	if (qpair->poll_group != NULL && rqpair->link_connecting.tqe_prev == NULL) {
+	if (qpair->poll_group != NULL && TAILQ_ENTRY_NOT_ENQUEUED(rqpair, link_connecting)) {
 		group = nvme_rdma_poll_group(qpair->poll_group);
 		TAILQ_INSERT_TAIL(&group->connecting_qpairs, rqpair, link_connecting);
 	}
@@ -2188,7 +2191,7 @@ _nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvm
 	rqpair->state = NVME_RDMA_QPAIR_STATE_EXITING;
 
 	if (rqpair->cm_id) {
-		if (rqpair->rdma_qp) {
+		if (rqpair->rdma_qp && rqpair->connected) {
 			rc = spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
 			if ((qpair->ctrlr != NULL) && (rc == 0)) {
 				rc = nvme_rdma_process_event_start(rqpair, RDMA_CM_EVENT_DISCONNECTED,
@@ -2362,7 +2365,7 @@ nvme_rdma_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 	struct nvme_rdma_ctrlr *rctrlr;
 	struct ibv_context **contexts;
 	struct ibv_device_attr dev_attr;
-	int i, flag, rc;
+	int i, rc;
 
 	rctrlr = spdk_zmalloc(sizeof(struct nvme_rdma_ctrlr), 0, NULL, SPDK_ENV_NUMA_ID_ANY,
 			      SPDK_MALLOC_DMA);
@@ -2435,9 +2438,7 @@ nvme_rdma_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
 		goto destruct_ctrlr;
 	}
 
-	flag = fcntl(rctrlr->cm_channel->fd, F_GETFL);
-	if (fcntl(rctrlr->cm_channel->fd, F_SETFL, flag | O_NONBLOCK) < 0) {
-		SPDK_ERRLOG("Cannot set event channel to non blocking\n");
+	if (spdk_fd_set_nonblock(rctrlr->cm_channel->fd) < 0) {
 		goto destruct_ctrlr;
 	}
 
@@ -2503,7 +2504,7 @@ _nvme_rdma_qpair_submit_request(struct nvme_rdma_qpair *rqpair,
 	struct ibv_send_wr *wr;
 	struct nvme_rdma_poll_group *group;
 
-	if (!rqpair->link_active.tqe_prev && qpair->poll_group) {
+	if (TAILQ_ENTRY_NOT_ENQUEUED(rqpair, link_active) && qpair->poll_group) {
 		group = nvme_rdma_poll_group(qpair->poll_group);
 		TAILQ_INSERT_TAIL(&group->active_qpairs, rqpair, link_active);
 	}
@@ -2969,7 +2970,6 @@ nvme_rdma_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 				    uint32_t max_completions)
 {
 	struct nvme_rdma_qpair		*rqpair = nvme_rdma_qpair(qpair);
-	struct nvme_rdma_ctrlr		*rctrlr = nvme_rdma_ctrlr(qpair->ctrlr);
 	int				rc = 0, batch_size;
 	struct ibv_cq			*cq;
 	uint64_t			rdma_completions = 0;
@@ -3009,9 +3009,6 @@ nvme_rdma_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		return -ENXIO;
 
 	default:
-		if (nvme_qpair_is_admin_queue(qpair)) {
-			nvme_rdma_poll_events(rctrlr);
-		}
 		nvme_rdma_qpair_process_cm_event(rqpair);
 		break;
 	}
@@ -3360,12 +3357,8 @@ nvme_rdma_poll_group_disconnect_qpair(struct spdk_nvme_qpair *qpair)
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(qpair);
 	struct nvme_rdma_poll_group *group = nvme_rdma_poll_group(qpair->poll_group);
 
-	if (rqpair->link_connecting.tqe_prev) {
-		TAILQ_REMOVE(&group->connecting_qpairs, rqpair, link_connecting);
-		/* We use prev pointer to check if qpair is in connecting list or not .
-		 * TAILQ_REMOVE doesn't do it. So, we do it manually.
-		 */
-		rqpair->link_connecting.tqe_prev = NULL;
+	if (TAILQ_ENTRY_ENQUEUED(rqpair, link_connecting)) {
+		TAILQ_REMOVE_CLEAR(&group->connecting_qpairs, rqpair, link_connecting);
 	}
 
 	return 0;
@@ -3394,9 +3387,8 @@ nvme_rdma_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 		nvme_rdma_ctrlr_disconnect_qpair(qpair->ctrlr, qpair);
 	}
 
-	if (rqpair->link_active.tqe_prev) {
-		TAILQ_REMOVE(&group->active_qpairs, rqpair, link_active);
-		rqpair->link_active.tqe_prev = NULL;
+	if (TAILQ_ENTRY_ENQUEUED(rqpair, link_active)) {
+		TAILQ_REMOVE_CLEAR(&group->active_qpairs, rqpair, link_active);
 	}
 
 	return 0;
@@ -3408,7 +3400,7 @@ nvme_rdma_qpair_process_submits(struct nvme_rdma_poll_group *group,
 {
 	struct spdk_nvme_qpair	*qpair = &rqpair->qpair;
 
-	assert(rqpair->link_active.tqe_prev != NULL);
+	assert(TAILQ_ENTRY_ENQUEUED(rqpair, link_active));
 
 	if (spdk_unlikely(rqpair->state <= NVME_RDMA_QPAIR_STATE_INITIALIZING ||
 			  rqpair->state >= NVME_RDMA_QPAIR_STATE_EXITING)) {
@@ -3429,11 +3421,7 @@ nvme_rdma_qpair_process_submits(struct nvme_rdma_poll_group *group,
 	}
 
 	if (rqpair->num_outstanding_reqs == 0 && STAILQ_EMPTY(&qpair->queued_req)) {
-		TAILQ_REMOVE(&group->active_qpairs, rqpair, link_active);
-		/* We use prev pointer to check if qpair is in active list or not.
-		 * TAILQ_REMOVE doesn't do it. So, we do it manually.
-		 */
-		rqpair->link_active.tqe_prev = NULL;
+		TAILQ_REMOVE_CLEAR(&group->active_qpairs, rqpair, link_active);
 	}
 }
 
@@ -3470,11 +3458,7 @@ nvme_rdma_poll_group_process_completions(struct spdk_nvme_transport_poll_group *
 
 		rc = nvme_rdma_ctrlr_connect_qpair_poll(qpair->ctrlr, qpair);
 		if (rc == 0 || rc != -EAGAIN) {
-			TAILQ_REMOVE(&group->connecting_qpairs, rqpair, link_connecting);
-			/* We use prev pointer to check if qpair is in connecting list or not.
-			 * TAILQ_REMOVE does not do it. So, we do it manually.
-			 */
-			rqpair->link_connecting.tqe_prev = NULL;
+			TAILQ_REMOVE_CLEAR(&group->connecting_qpairs, rqpair, link_connecting);
 
 			if (rc == 0) {
 				/* Once the connection is completed, we can submit queued requests */
@@ -3638,6 +3622,12 @@ nvme_rdma_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 	return 1;
 }
 
+static int
+nvme_rdma_ctrlr_process_transport_events(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return nvme_rdma_poll_events(nvme_rdma_ctrlr(ctrlr));
+}
+
 void
 spdk_nvme_rdma_init_hooks(struct spdk_nvme_rdma_hooks *hooks)
 {
@@ -3670,6 +3660,7 @@ const struct spdk_nvme_transport_ops rdma_ops = {
 	.ctrlr_disconnect_qpair = nvme_rdma_ctrlr_disconnect_qpair,
 
 	.ctrlr_get_memory_domains = nvme_rdma_ctrlr_get_memory_domains,
+	.ctrlr_process_transport_events = nvme_rdma_ctrlr_process_transport_events,
 
 	.qpair_abort_reqs = nvme_rdma_qpair_abort_reqs,
 	.qpair_reset = nvme_rdma_qpair_reset,

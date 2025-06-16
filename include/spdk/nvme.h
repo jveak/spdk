@@ -4699,6 +4699,9 @@ struct spdk_nvme_transport_ops {
 
 	/* Optional callback for transports to process removal events of attached controllers. */
 	int (*ctrlr_scan_attached)(struct spdk_nvme_probe_ctx *probe_ctx);
+
+	/* Optional callback for transports to process transport-specific events. E.g. poll RDMA_CM event channel */
+	int (*ctrlr_process_transport_events)(struct spdk_nvme_ctrlr *ctrlr);
 };
 
 /**
@@ -4762,8 +4765,16 @@ struct spdk_nvme_transport_opts {
 	 * Configure UMR per IO request if supported by the system
 	 */
 	bool rdma_umr_per_io;
+
+	/* Hole at byte 23. */
+	uint8_t reserved23;
+
+	/**
+	 * Time in msec to wait until connection is done (0 = no timeout).
+	 */
+	uint32_t tcp_connect_timeout_ms;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_transport_opts) == 24, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_transport_opts) == 32, "Incorrect size");
 
 /**
  * Get the current NVMe transport options.

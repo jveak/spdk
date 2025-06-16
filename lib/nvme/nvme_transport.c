@@ -30,6 +30,7 @@ struct spdk_nvme_transport_opts g_spdk_nvme_transport_opts = {
 	.rdma_max_cq_size = 0,
 	.rdma_cm_event_timeout_ms = 1000,
 	.rdma_umr_per_io = false,
+	.tcp_connect_timeout_ms = 0,
 };
 
 const struct spdk_nvme_transport *
@@ -613,6 +614,22 @@ nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
 	return 0;
 }
 
+int
+nvme_transport_ctrlr_process_transport_events(struct spdk_nvme_ctrlr *ctrlr)
+{
+	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
+	int rc = 0;
+
+	assert(transport != NULL);
+	if (transport->ops.ctrlr_process_transport_events) {
+		nvme_ctrlr_lock(ctrlr);
+		rc = transport->ops.ctrlr_process_transport_events(ctrlr);
+		nvme_ctrlr_unlock(ctrlr);
+	}
+
+	return rc;
+}
+
 void
 nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair)
 {
@@ -901,10 +918,11 @@ spdk_nvme_transport_get_opts(struct spdk_nvme_transport_opts *opts, size_t opts_
 	SET_FIELD(rdma_max_cq_size);
 	SET_FIELD(rdma_cm_event_timeout_ms);
 	SET_FIELD(rdma_umr_per_io);
+	SET_FIELD(tcp_connect_timeout_ms);
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_transport_opts) == 24, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_transport_opts) == 32, "Incorrect size");
 
 #undef SET_FIELD
 }
@@ -931,6 +949,12 @@ spdk_nvme_transport_set_opts(const struct spdk_nvme_transport_opts *opts, size_t
 	SET_FIELD(rdma_max_cq_size);
 	SET_FIELD(rdma_cm_event_timeout_ms);
 	SET_FIELD(rdma_umr_per_io);
+	SET_FIELD(tcp_connect_timeout_ms);
+
+	if (g_spdk_nvme_transport_opts.tcp_connect_timeout_ms > INT_MAX) {
+		SPDK_ERRLOG("tcp_connect_timeout_ms opt cannot exceed INT_MAX\n");
+		return -EINVAL;
+	}
 
 	g_spdk_nvme_transport_opts.opts_size = opts->opts_size;
 

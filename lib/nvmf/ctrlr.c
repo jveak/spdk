@@ -23,11 +23,6 @@
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
 
-#define MIN_KEEP_ALIVE_TIMEOUT_IN_MS 10000
-#define NVMF_DISC_KATO_IN_MS 120000
-#define KAS_TIME_UNIT_IN_MS 100
-#define KAS_DEFAULT_VALUE (MIN_KEEP_ALIVE_TIMEOUT_IN_MS / KAS_TIME_UNIT_IN_MS)
-
 #define NVMF_CC_RESET_SHN_TIMEOUT_IN_MS	10000
 
 #define NVMF_CTRLR_RESET_SHN_TIMEOUT_IN_MS	(NVMF_CC_RESET_SHN_TIMEOUT_IN_MS + 5000)
@@ -374,7 +369,7 @@ nvmf_ctrlr_cdata_init(struct spdk_nvmf_transport *transport, struct spdk_nvmf_su
 		      struct spdk_nvmf_ctrlr_data *cdata)
 {
 	cdata->aerl = SPDK_NVMF_MAX_ASYNC_EVENTS - 1;
-	cdata->kas = KAS_DEFAULT_VALUE;
+	cdata->kas = transport->opts.kas;
 	cdata->vid = SPDK_PCI_VID_INTEL;
 	cdata->ssvid = SPDK_PCI_VID_INTEL;
 	/* INTEL OUI */
@@ -476,9 +471,14 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	 * If this field is cleared to 0h, then Keep Alive is not supported.
 	 */
 	if (ctrlr->cdata.kas) {
-		ctrlr->feat.keep_alive_timer.bits.kato = spdk_divide_round_up(connect_cmd->kato,
-				KAS_DEFAULT_VALUE * KAS_TIME_UNIT_IN_MS) *
-				KAS_DEFAULT_VALUE * KAS_TIME_UNIT_IN_MS;
+		if (connect_cmd->kato == 0) {
+			ctrlr->feat.keep_alive_timer.bits.kato = 0;
+		} else if (connect_cmd->kato <= transport->opts.min_kato) {
+			ctrlr->feat.keep_alive_timer.bits.kato = transport->opts.min_kato;
+		} else {
+			ctrlr->feat.keep_alive_timer.bits.kato = spdk_round_up(connect_cmd->kato,
+					ctrlr->cdata.kas * NVMF_KAS_TIME_UNIT_IN_MS);
+		}
 	}
 
 	ctrlr->feat.async_event_configuration.bits.ns_attr_notice = 1;
@@ -2011,6 +2011,7 @@ static int
 nvmf_ctrlr_set_features_keep_alive_timer(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+	struct spdk_nvmf_transport *transport = req->qpair->transport;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
 
@@ -2022,14 +2023,13 @@ nvmf_ctrlr_set_features_keep_alive_timer(struct spdk_nvmf_request *req)
 	 */
 	if (cmd->cdw11_bits.feat_keep_alive_timer.bits.kato == 0) {
 		rsp->status.sc = SPDK_NVME_SC_KEEP_ALIVE_INVALID;
-	} else if (cmd->cdw11_bits.feat_keep_alive_timer.bits.kato < MIN_KEEP_ALIVE_TIMEOUT_IN_MS) {
-		ctrlr->feat.keep_alive_timer.bits.kato = MIN_KEEP_ALIVE_TIMEOUT_IN_MS;
+	} else if (cmd->cdw11_bits.feat_keep_alive_timer.bits.kato <= transport->opts.min_kato) {
+		ctrlr->feat.keep_alive_timer.bits.kato = transport->opts.min_kato;
 	} else {
 		/* round up to milliseconds */
-		ctrlr->feat.keep_alive_timer.bits.kato = spdk_divide_round_up(
+		ctrlr->feat.keep_alive_timer.bits.kato = spdk_round_up(
 					cmd->cdw11_bits.feat_keep_alive_timer.bits.kato,
-					KAS_DEFAULT_VALUE * KAS_TIME_UNIT_IN_MS) *
-				KAS_DEFAULT_VALUE * KAS_TIME_UNIT_IN_MS;
+					transport->opts.kas * NVMF_KAS_TIME_UNIT_IN_MS);
 	}
 
 	/*
@@ -4585,6 +4585,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 
 	if (ctrlr->subsys->passthrough) {
 		assert(ns->passthru_nsid > 0);
+		req->orig_nsid = req->cmd->nvme_cmd.nsid;
 		req->cmd->nvme_cmd.nsid = ns->passthru_nsid;
 
 		return nvmf_bdev_ctrlr_nvme_passthru_io(bdev, desc, ch, req);
@@ -4635,6 +4636,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 				goto invalid_opcode;
 			}
 			if (ns->passthru_nsid) {
+				req->orig_nsid = req->cmd->nvme_cmd.nsid;
 				req->cmd->nvme_cmd.nsid = ns->passthru_nsid;
 			}
 			return nvmf_bdev_ctrlr_nvme_passthru_io(bdev, desc, ch, req);
@@ -4691,16 +4693,23 @@ _nvmf_request_complete(void *ctx)
 	rsp->sqid = 0;
 	rsp->status.p = 0;
 	rsp->cid = req->cmd->nvme_cmd.cid;
-	nsid = req->cmd->nvme_cmd.nsid;
 	opcode = req->cmd->nvmf_cmd.opcode;
-
 	qpair = req->qpair;
+
 	if (spdk_likely(qpair->ctrlr)) {
 		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
 		assert(sgroup != NULL);
-		is_aer = req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST;
 		if (spdk_likely(qpair->qid != 0)) {
 			qpair->group->stat.completed_nvme_io++;
+		} else if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+			is_aer = true;
+		}
+
+		/* If we changed nvme_cmd.nsid to match the passthrough nsid, we need to
+		 * restore it here for accounting purposes.
+		 */
+		if (qpair->ctrlr->subsys->passthrough && req->orig_nsid) {
+			req->cmd->nvme_cmd.nsid = req->orig_nsid;
 		}
 
 		/*
@@ -4716,6 +4725,8 @@ _nvmf_request_complete(void *ctx)
 	} else if (spdk_unlikely(nvmf_request_is_fabric_connect(req))) {
 		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	}
+
+	nsid = req->cmd->nvme_cmd.nsid;
 
 	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf")) {
 		spdk_nvme_print_completion(qpair->qid, rsp);
@@ -4762,6 +4773,7 @@ _nvmf_request_complete(void *ctx)
 
 				/* NOTE: This implicitly also checks for 0, since 0 - 1 wraps around to UINT32_MAX. */
 				if (spdk_likely(nsid - 1 < sgroup->num_ns)) {
+					assert(sgroup->ns_info[nsid - 1].io_outstanding != 0);
 					sgroup->ns_info[nsid - 1].io_outstanding--;
 				}
 			}

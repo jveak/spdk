@@ -723,9 +723,36 @@ memory_iter_cb(const struct rte_memseg_list *msl,
 	return spdk_mem_register(ms->addr, len);
 }
 
+static bool g_mem_event_cb_registered = false;
+
+static int
+mem_map_mem_event_callback_register(void)
+{
+	int rc;
+
+	rc = rte_mem_event_callback_register("spdk", memory_hotplug_cb, NULL);
+	if (rc != 0) {
+		return rc;
+	}
+
+	g_mem_event_cb_registered = true;
+	return 0;
+}
+
+static void
+mem_map_mem_event_callback_unregister(void)
+{
+	if (g_mem_event_cb_registered) {
+		g_mem_event_cb_registered = false;
+		rte_mem_event_callback_unregister("spdk", NULL);
+	}
+}
+
 int
 mem_map_init(bool legacy_mem)
 {
+	int rc;
+
 	g_legacy_mem = legacy_mem;
 
 	g_mem_reg_map = spdk_mem_map_alloc(0, NULL, NULL);
@@ -734,15 +761,46 @@ mem_map_init(bool legacy_mem)
 		return -ENOMEM;
 	}
 
+	if (!g_huge_pages) {
+		return 0;
+	}
+
+	if (!g_legacy_mem) {
+		/**
+		 * To prevent DPDK complaining, only register the callback when
+		 * we are not in legacy mem mode.
+		 */
+		rc = mem_map_mem_event_callback_register();
+		if (rc != 0) {
+			DEBUG_PRINT("memory event callback registration failed, rc = %d\n", rc);
+			goto err_free_reg_map;
+		}
+	}
+
 	/*
 	 * Walk all DPDK memory segments and register them
 	 * with the main memory map
 	 */
-	if (g_huge_pages) {
-		rte_mem_event_callback_register("spdk", memory_hotplug_cb, NULL);
-		rte_memseg_contig_walk(memory_iter_cb, NULL);
+	rc = rte_memseg_contig_walk(memory_iter_cb, NULL);
+	if (rc != 0) {
+		DEBUG_PRINT("memory segments walking failed, rc = %d\n", rc);
+		goto err_unregister_mem_cb;
 	}
+
 	return 0;
+
+err_unregister_mem_cb:
+	mem_map_mem_event_callback_unregister();
+err_free_reg_map:
+	spdk_mem_map_free(&g_mem_reg_map);
+	return rc;
+}
+
+void
+mem_map_fini(void)
+{
+	mem_map_mem_event_callback_unregister();
+	spdk_mem_map_free(&g_mem_reg_map);
 }
 
 bool
@@ -1554,6 +1612,14 @@ vtophys_init(void)
 		}
 	}
 	return 0;
+}
+
+void
+vtophys_fini(void)
+{
+	spdk_mem_map_free(&g_vtophys_map);
+	spdk_mem_map_free(&g_numa_map);
+	spdk_mem_map_free(&g_phys_ref_map);
 }
 
 uint64_t

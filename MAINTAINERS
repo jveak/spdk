@@ -198,7 +198,9 @@ F:	module/event/subsystems/keyring/
 S:	Supported
 
 LINUX AIO BDEV MODULE
+M:	Jacek Kalwas <jacek.kalwas@nutanix.com>
 F:	module/bdev/aio/
+S:	Supported
 
 LOGGING LIBRARY
 F:	lib/log/
@@ -253,7 +255,11 @@ F:	lib/nvme/
 S:	Supported
 
 NVME DRIVER (PCIE)
+M:	Ankit Kumar <ankit.kumar@samsung.com>
 F:	lib/nvme/*pcie*
+F:	include/spdk/nvme_*
+F:	test/unit/lib/nvme/nvme_pcie*
+S:	Supported
 
 NVME DRIVER (RDMA)
 M:	Alexey Marchuk <alexeymar@nvidia.com>
@@ -279,19 +285,25 @@ NVME DISCOVERY APPLICATION
 F:	app/spdk_nvme_discover/
 
 NVME FIO PLUGIN
+M:	Ankit Kumar <ankit.kumar@samsung.com>
 F:	app/fio/nvme/
+S:	Supported
 
 NVME IDENTIFY APPLICATION
+M:	Ankit Kumar <ankit.kumar@samsung.com>
 F:	app/spdk_nvme_identify/
+S:	Supported
 
 NVME PERF APPLICATION
 M:	Alexey Marchuk <alexeymar@nvidia.com>
+M:	Ankit Kumar <ankit.kumar@samsung.com>
 F:	app/spdk_nvme_perf/
 S:	Supported
 
 NVMF TARGET (CORE)
 M:	Jim Harris <jim.harris@nvidia.com>
 M:	Konrad Sztyber <ksztyber@nvidia.com>
+M:	Jacek Kalwas <jacek.kalwas@nutanix.com>
 F:	lib/nvmf/
 F:	app/nvmf_tgt/
 F:	module/event/subsystems/nvmf/
@@ -327,9 +339,13 @@ F:	lib/env_ocf/
 F:	module/bdev/ocf/
 
 POSIX SOCK MODULE
+M:	Jacek Kalwas <jacek.kalwas@nutanix.com>
 F:	module/sock/posix/
+S:	Supported
 
 RAID BDEV MODULE
+M:	Artur Paszkiewicz <artur.paszkiewicz@solidigm.com>
+S:	Supported
 F:	module/bdev/raid/
 
 RDMA SUPPORT LIBRARIES
@@ -353,8 +369,15 @@ F:	module/event/subsystems/scsi/
 
 SOCKET LAYER
 M:	Ben Walker <ben@nvidia.com>
+M:	Jacek Kalwas <jacek.kalwas@nutanix.com>
 F:	lib/sock/
 F:	module/event/subsystems/sock/
+F:	include/spdk/sock.h
+F:	include/spdk_internal/sock.h
+F:	examples/sock/
+F:	test/iscsi_tgt/sock/
+F:	test/unit/lib/sock/
+S:	Supported
 
 SPDK COMBINED TARGET APPLICATION
 F:	app/spdk_tgt/
