@@ -16,6 +16,10 @@ ifeq ($(CONFIG_RAID5F),y)
 C_SRCS += raid5f.c
 endif
 
+ifeq ($(CONFIG_RAID5),y)
+C_SRCS += raid5.c
+endif
+
 LIBNAME = bdev_raid
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
