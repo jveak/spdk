@@ -323,6 +323,22 @@ void spdk_copy_buf_to_iovs(struct iovec *iovs, int iovcnt, void *buf,
 			   size_t buf_len);
 
 /**
+ * Copy from iovs into a contiguous buffer, starting at a specific offset
+ * within the iovs.
+ *
+ * \param dst Destination buffer.
+ * \param len Number of bytes to copy.
+ * \param iovs Source iovs.
+ * \param iovcnt Number of source iovs.
+ * \param iov_offset Offset in bytes from the start of the iovs to begin copying from.
+ *
+ * \return The number of bytes copied. This will be less than len if the iovs
+ * are smaller than len + iov_offset.
+ */
+size_t spdk_iov_cpy_to_buf(void *dst, size_t len, struct iovec *iovs, int iovcnt,
+			   size_t iov_offset);
+
+/**
  * Scan build is really pessimistic and assumes that mempool functions can
  * dequeue NULL buffers even if they return success. This is obviously a false
  * positive, but the mempool dequeue can be done in a DPDK inline function that

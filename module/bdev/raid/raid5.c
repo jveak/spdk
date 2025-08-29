@@ -41,6 +41,7 @@ struct stripe_request {
 		STRIPE_REQ_WRITE,
 		STRIPE_REQ_RECONSTRUCT,
 		STRIPE_REQ_SMALL_WRITE,
+		STRIPE_REQ_PARTIAL_WRITE,
 	} type;
 
 	struct raid5_io_channel *r5ch;
@@ -81,6 +82,21 @@ struct stripe_request {
 			void *old_data;
 			void *old_parity;
 		} smallwrite;
+
+		struct {
+			/* Buffers for data chunks that need to be read before parity calculation. */
+			void **data_buffers;
+			/* Buffer for the new parity. */
+			void *parity_buf;
+			/* Buffers for metadata of chunks that need to be read. */
+			void **md_buffers;
+			/* Buffer for new parity metadata */
+			void *parity_md_buf;
+			/* Bitmap of data chunks to read. */
+			uint64_t read_chunks_mask;
+			/* Number of remaining read operations. */
+			uint32_t remaining_reads;
+		} partial_write;
 	};
 
 	/* Array of iovec iterators for each chunk */
@@ -129,6 +145,7 @@ struct raid5_io_channel {
 		TAILQ_HEAD(, stripe_request) write;
 		TAILQ_HEAD(, stripe_request) reconstruct;
 		TAILQ_HEAD(, stripe_request) small_write;
+		TAILQ_HEAD(, stripe_request) partial_write;
 	} free_stripe_requests;
 
 	/* accel_fw channel */
@@ -192,6 +209,8 @@ raid5_stripe_request_release(struct stripe_request *stripe_req)
 		TAILQ_INSERT_HEAD(&stripe_req->r5ch->free_stripe_requests.reconstruct, stripe_req, link);
 	} else if (stripe_req->type == STRIPE_REQ_SMALL_WRITE) {
 		TAILQ_INSERT_HEAD(&stripe_req->r5ch->free_stripe_requests.small_write, stripe_req, link);
+	} else if (stripe_req->type == STRIPE_REQ_PARTIAL_WRITE) {
+		TAILQ_INSERT_HEAD(&stripe_req->r5ch->free_stripe_requests.partial_write, stripe_req, link);
 	} else {
 		assert(false);
 	}
@@ -299,7 +318,8 @@ raid5_xor_stripe(struct stripe_request *stripe_req, stripe_req_xor_cb cb)
 
 	assert(cb != NULL);
 
-	if (spdk_likely(stripe_req->type == STRIPE_REQ_WRITE)) {
+	if (spdk_likely(stripe_req->type == STRIPE_REQ_WRITE ||
+			stripe_req->type == STRIPE_REQ_PARTIAL_WRITE)) {
 		num_blocks = raid_bdev->strip_size;
 		dest_chunk = stripe_req->parity_chunk;
 	} else if (stripe_req->type == STRIPE_REQ_RECONSTRUCT) {
@@ -350,7 +370,7 @@ raid5_xor_stripe(struct stripe_request *stripe_req, stripe_req_xor_cb cb)
 					    raid5_xor_stripe_md_cb, stripe_req);
 		if (spdk_unlikely(ret)) {
 			if (ret == -ENOMEM) {
-				TAILQ_INSERT_HEAD(&stripe_req->r5ch->xor_retry_queue, stripe_req, link);
+				TAILQ_INSERT_HEAD(&r5ch->xor_retry_queue, stripe_req, link);
 			} else {
 				stripe_req->xor.status = ret;
 				raid5_xor_stripe_done(stripe_req);
@@ -633,6 +653,14 @@ raid5_stripe_write_request_xor_done(struct stripe_request *stripe_req, int statu
 static int
 raid5_submit_small_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
 				 uint64_t stripe_offset);
+
+static int
+raid5_submit_partial_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
+				   uint64_t stripe_offset);
+
+static int
+raid5_submit_partial_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
+				   uint64_t stripe_offset);
 
 static int
 raid5_submit_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index)
@@ -1012,6 +1040,292 @@ raid5_small_write_write_complete(struct spdk_bdev_io *bdev_io, bool success, voi
 }
 
 static void
+raid5_partial_write_write_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct stripe_request *stripe_req = cb_arg;
+	struct raid_bdev_io *raid_io = stripe_req->raid_io;
+
+	if (bdev_io != NULL) {
+		spdk_bdev_free_io(bdev_io);
+	}
+
+	if (!success) {
+		if (raid_io->base_bdev_io_status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+			raid_io->base_bdev_io_status = SPDK_BDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	if (--raid_io->base_bdev_io_remaining == 0) {
+		raid_bdev_io_complete(raid_io, raid_io->base_bdev_io_status);
+		raid5_stripe_request_release(stripe_req);
+	}
+}
+
+static void
+raid5_partial_write_xor_done(struct stripe_request *stripe_req, int status)
+{
+	struct raid_bdev_io *raid_io = stripe_req->raid_io;
+	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid5_info *r5_info = raid_bdev->module_private;
+	uint64_t strip_size = raid_bdev->strip_size;
+	uint8_t data_chunks_num = raid5_stripe_data_chunks_num(raid_bdev);
+	uint64_t stripe_offset = raid_io->offset_blocks % r5_info->stripe_blocks;
+	uint64_t write_start_in_stripe = stripe_offset;
+	uint64_t write_end_in_stripe = stripe_offset + raid_io->num_blocks;
+	int raid_io_iov_idx = 0;
+	size_t raid_io_internal_offset = 0;
+	int ret;
+
+	if (status != 0) {
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		raid5_stripe_request_release(stripe_req);
+		return;
+	}
+
+	raid_io->base_bdev_io_remaining = 0;
+	raid_io->base_bdev_io_status = SPDK_BDEV_IO_STATUS_SUCCESS;
+
+	/* Write new data chunks */
+	for (uint8_t d_idx = 0; d_idx < data_chunks_num; d_idx++) {
+		uint64_t chunk_start_in_stripe = d_idx * strip_size;
+		uint64_t chunk_end_in_stripe = (d_idx + 1) * strip_size;
+		uint64_t overlap_start = spdk_max(chunk_start_in_stripe, write_start_in_stripe);
+		uint64_t overlap_end = spdk_min(chunk_end_in_stripe, write_end_in_stripe);
+
+		if (overlap_start < overlap_end) {
+			uint8_t b_idx = d_idx < stripe_req->parity_chunk->index ? d_idx : d_idx + 1;
+			struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[b_idx];
+			struct spdk_io_channel *base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, b_idx);
+			uint64_t len_blocks = overlap_end - overlap_start;
+			uint64_t offset_in_chunk = overlap_start - chunk_start_in_stripe;
+			uint64_t base_offset_blocks = (stripe_req->stripe_index << r5_info->raid_bdev->strip_size_shift) +
+						      offset_in_chunk;
+			struct iovec iovs[raid_io->iovcnt];
+			int iovcnt = 0;
+			uint64_t len_bytes = len_blocks * raid_bdev->bdev.blocklen;
+			uint64_t current_len = 0;
+
+			while (current_len < len_bytes) {
+				uint64_t iov_len = raid_io->iovs[raid_io_iov_idx].iov_len - raid_io_internal_offset;
+				uint64_t copy_len = spdk_min(iov_len, len_bytes - current_len);
+
+				iovs[iovcnt].iov_base = raid_io->iovs[raid_io_iov_idx].iov_base + raid_io_internal_offset;
+				iovs[iovcnt].iov_len = copy_len;
+				current_len += copy_len;
+				raid_io_internal_offset += copy_len;
+				if (raid_io_internal_offset == raid_io->iovs[raid_io_iov_idx].iov_len) {
+					raid_io_iov_idx++;
+					raid_io_internal_offset = 0;
+				}
+				iovcnt++;
+			}
+
+			raid_io->base_bdev_io_remaining++;
+			ret = raid_bdev_writev_blocks_ext(base_info, base_ch, iovs, iovcnt, base_offset_blocks, len_blocks,
+							  raid5_partial_write_write_complete, stripe_req, NULL);
+			if (ret != 0) {
+				raid_io->base_bdev_io_remaining--;
+				goto err;
+			}
+		}
+	}
+
+	/* Write new parity */
+	uint8_t p_idx = stripe_req->parity_chunk->index;
+	struct raid_base_bdev_info *parity_base_info = &raid_bdev->base_bdev_info[p_idx];
+	struct spdk_io_channel *parity_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, p_idx);
+	struct iovec parity_iov;
+
+	parity_iov.iov_base = stripe_req->partial_write.parity_buf;
+	parity_iov.iov_len = strip_size * raid_bdev->bdev.blocklen;
+
+	raid_io->base_bdev_io_remaining++;
+	ret = raid_bdev_writev_blocks_ext(parity_base_info, parity_ch, &parity_iov, 1,
+					  stripe_req->stripe_index << r5_info->raid_bdev->strip_size_shift,
+					  strip_size, raid5_partial_write_write_complete, stripe_req, NULL);
+	if (ret != 0) {
+		raid_io->base_bdev_io_remaining--;
+		goto err;
+	}
+
+	return;
+
+err:
+	raid5_partial_write_write_complete(NULL, false, stripe_req);
+}
+
+static void
+raid5_partial_write_reads_complete(struct stripe_request *stripe_req, enum spdk_bdev_io_status status)
+{
+	struct raid_bdev_io *raid_io = stripe_req->raid_io;
+	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid5_info *r5_info = raid_bdev->module_private;
+	uint64_t strip_size = raid_bdev->strip_size;
+	uint8_t data_chunks_num = raid5_stripe_data_chunks_num(raid_bdev);
+	uint64_t stripe_offset = raid_io->offset_blocks % r5_info->stripe_blocks;
+	uint64_t write_start_in_stripe = stripe_offset;
+	uint64_t write_end_in_stripe = stripe_offset + raid_io->num_blocks;
+
+	if (status != SPDK_BDEV_IO_STATUS_SUCCESS) {
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		raid5_stripe_request_release(stripe_req);
+		return;
+	}
+
+	if (--stripe_req->partial_write.remaining_reads != 0) {
+		return;
+	}
+
+	/* All reads are complete. Now assemble the stripe data for XOR. */
+	for (uint8_t d_idx = 0; d_idx < data_chunks_num; d_idx++) {
+		uint8_t b_idx = d_idx < stripe_req->parity_chunk->index ? d_idx : d_idx + 1;
+		struct chunk *chunk = &stripe_req->chunks[b_idx];
+		void *chunk_buf = stripe_req->partial_write.data_buffers[d_idx];
+		uint64_t chunk_start_in_stripe = d_idx * strip_size;
+		uint64_t chunk_end_in_stripe = (d_idx + 1) * strip_size;
+		uint64_t overlap_start = spdk_max(chunk_start_in_stripe, write_start_in_stripe);
+		uint64_t overlap_end = spdk_min(chunk_end_in_stripe, write_end_in_stripe);
+		size_t copied;
+
+		if (stripe_req->partial_write.read_chunks_mask & (1ULL << d_idx)) {
+			/* This chunk was not fully overwritten. Its old content is in chunk_buf.
+			 * Copy the new data into it if there is any overlap. */
+			if (overlap_start < overlap_end) {
+				uint64_t len_bytes = (overlap_end - overlap_start) * raid_bdev->bdev.blocklen;
+				uint64_t offset_in_chunk_bytes = (overlap_start - chunk_start_in_stripe) * raid_bdev->bdev.blocklen;
+				uint64_t offset_in_write_bytes = (overlap_start - write_start_in_stripe) * raid_bdev->bdev.blocklen;
+
+				copied = spdk_iov_cpy_to_buf(chunk_buf + offset_in_chunk_bytes, len_bytes,
+							     raid_io->iovs, raid_io->iovcnt,
+							     offset_in_write_bytes);
+				if (copied != len_bytes) {
+					goto err;
+				}
+			}
+		} else {
+			/* This chunk is fully overwritten. Copy the new data into the buffer. */
+			uint64_t len_bytes = strip_size * raid_bdev->bdev.blocklen;
+			uint64_t offset_in_write_bytes = (chunk_start_in_stripe - write_start_in_stripe) * raid_bdev->bdev.blocklen;
+			copied = spdk_iov_cpy_to_buf(chunk_buf, len_bytes,
+						     raid_io->iovs, raid_io->iovcnt, offset_in_write_bytes);
+			if (copied != len_bytes) {
+				goto err;
+			}
+		}
+
+		chunk->iovs[0].iov_base = chunk_buf;
+		chunk->iovs[0].iov_len = strip_size * raid_bdev->bdev.blocklen;
+		chunk->iovcnt = 1;
+	}
+
+	/* Setup parity chunk to receive the new parity data */
+	stripe_req->parity_chunk->iovs[0].iov_base = stripe_req->partial_write.parity_buf;
+	stripe_req->parity_chunk->iovs[0].iov_len = strip_size * raid_bdev->bdev.blocklen;
+	stripe_req->parity_chunk->iovcnt = 1;
+
+	raid5_xor_stripe(stripe_req, raid5_partial_write_xor_done);
+	return;
+
+err:
+	SPDK_ERRLOG("Partial write data preparation failed\n");
+	raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+	raid5_stripe_request_release(stripe_req);
+}
+
+static void
+raid5_partial_write_read_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct stripe_request *stripe_req = cb_arg;
+	enum spdk_bdev_io_status s = success ? SPDK_BDEV_IO_STATUS_SUCCESS :
+				     SPDK_BDEV_IO_STATUS_FAILED;
+
+	spdk_bdev_free_io(bdev_io);
+	raid5_partial_write_reads_complete(stripe_req, s);
+}
+
+static int
+raid5_submit_partial_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_index,
+				   uint64_t stripe_offset)
+{
+	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid5_io_channel *r5ch = raid_bdev_channel_get_module_ctx(raid_io->raid_ch);
+	struct stripe_request *stripe_req;
+	struct raid5_info *r5_info = raid_bdev->module_private;
+	uint64_t strip_size = raid_bdev->strip_size;
+	uint8_t data_chunks_num = raid5_stripe_data_chunks_num(raid_bdev);
+	uint64_t start_block_in_stripe = stripe_offset;
+	uint64_t end_block_in_stripe = stripe_offset + raid_io->num_blocks;
+	uint8_t p_idx;
+	uint8_t d_idx;
+
+	stripe_req = TAILQ_FIRST(&r5ch->free_stripe_requests.partial_write);
+	if (stripe_req == NULL) {
+		return -ENOMEM;
+	}
+	TAILQ_REMOVE(&r5ch->free_stripe_requests.partial_write, stripe_req, link);
+
+	raid5_stripe_request_init(stripe_req, raid_io, stripe_index);
+	raid_io->module_private = stripe_req;
+	p_idx = stripe_req->parity_chunk->index;
+
+	stripe_req->partial_write.read_chunks_mask = 0;
+	stripe_req->partial_write.remaining_reads = 0;
+
+	for (d_idx = 0; d_idx < data_chunks_num; d_idx++) {
+		uint64_t chunk_start_in_stripe = d_idx * strip_size;
+		uint64_t chunk_end_in_stripe = (d_idx + 1) * strip_size;
+		bool fully_overwritten = start_block_in_stripe <= chunk_start_in_stripe &&
+					 end_block_in_stripe >= chunk_end_in_stripe;
+
+		if (!fully_overwritten) {
+			uint8_t b_idx = d_idx < p_idx ? d_idx : d_idx + 1;
+			if (raid_bdev_channel_get_base_channel(raid_io->raid_ch, b_idx) != NULL) {
+				stripe_req->partial_write.read_chunks_mask |= (1ULL << d_idx);
+				stripe_req->partial_write.remaining_reads++;
+			}
+		}
+	}
+
+	if (stripe_req->partial_write.remaining_reads == 0) {
+		raid5_partial_write_reads_complete(stripe_req, SPDK_BDEV_IO_STATUS_SUCCESS);
+		return 0;
+	}
+
+	for (d_idx = 0; d_idx < data_chunks_num; d_idx++) {
+		if (stripe_req->partial_write.read_chunks_mask & (1ULL << d_idx)) {
+			uint8_t b_idx = d_idx < p_idx ? d_idx : d_idx + 1;
+			struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[b_idx];
+			struct spdk_io_channel *base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, b_idx);
+			struct iovec iov;
+			struct spdk_bdev_ext_io_opts io_opts;
+			int ret;
+
+			iov.iov_base = stripe_req->partial_write.data_buffers[d_idx];
+			iov.iov_len = strip_size * raid_bdev->bdev.blocklen;
+
+			raid5_init_ext_io_opts(&io_opts, raid_io);
+			if (raid_io->md_buf) {
+				io_opts.metadata = stripe_req->partial_write.md_buffers[d_idx];
+			} else {
+				io_opts.metadata = NULL;
+			}
+
+			ret = raid_bdev_readv_blocks_ext(base_info, base_ch, &iov, 1,
+							 stripe_index << r5_info->raid_bdev->strip_size_shift,
+							 strip_size,
+							 raid5_partial_write_read_complete_cb, stripe_req, &io_opts);
+			if (ret != 0) {
+				stripe_req->partial_write.remaining_reads = 1;
+				raid5_partial_write_reads_complete(stripe_req, SPDK_BDEV_IO_STATUS_FAILED);
+				return ret;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static void
 raid5_submit_rw_request(struct raid_bdev_io *raid_io)
 {
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
@@ -1028,8 +1342,10 @@ raid5_submit_rw_request(struct raid_bdev_io *raid_io)
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if (stripe_offset == 0 && raid_io->num_blocks == r5_info->stripe_blocks) {
 			ret = raid5_submit_write_request(raid_io, stripe_index);
-		} else {
+		} else if ((stripe_offset % raid_bdev->strip_size) + raid_io->num_blocks <= raid_bdev->strip_size) {
 			ret = raid5_submit_small_write_request(raid_io, stripe_index, stripe_offset);
+		} else {
+			ret = raid5_submit_partial_write_request(raid_io, stripe_index, stripe_offset);
 		}
 		break;
 	default:
@@ -1076,6 +1392,26 @@ raid5_stripe_request_free(struct stripe_request *stripe_req)
 	} else if (stripe_req->type == STRIPE_REQ_SMALL_WRITE) {
 		spdk_dma_free(stripe_req->smallwrite.old_data);
 		spdk_dma_free(stripe_req->smallwrite.old_parity);
+	} else if (stripe_req->type == STRIPE_REQ_PARTIAL_WRITE) {
+		struct raid5_info *r5_info = raid5_ch_to_r5_info(stripe_req->r5ch);
+		struct raid_bdev *raid_bdev = r5_info->raid_bdev;
+		uint8_t data_chunks_num = raid5_stripe_data_chunks_num(raid_bdev);
+		uint8_t i;
+
+		if (stripe_req->partial_write.data_buffers) {
+			for (i = 0; i < data_chunks_num; i++) {
+				spdk_dma_free(stripe_req->partial_write.data_buffers[i]);
+			}
+			free(stripe_req->partial_write.data_buffers);
+		}
+		spdk_dma_free(stripe_req->partial_write.parity_buf);
+		if (stripe_req->partial_write.md_buffers) {
+			for (i = 0; i < data_chunks_num; i++) {
+				spdk_dma_free(stripe_req->partial_write.md_buffers[i]);
+			}
+			free(stripe_req->partial_write.md_buffers);
+		}
+		spdk_dma_free(stripe_req->partial_write.parity_md_buf);
 	} else {
 		assert(false);
 	}
@@ -1170,6 +1506,45 @@ raid5_stripe_request_alloc(struct raid5_io_channel *r5ch, enum stripe_request_ty
 		if (!stripe_req->smallwrite.old_parity) {
 			goto err;
 		}
+	} else if (type == STRIPE_REQ_PARTIAL_WRITE) {
+		uint8_t data_chunks_num = raid5_stripe_data_chunks_num(raid_bdev);
+		uint8_t i;
+
+		stripe_req->partial_write.data_buffers = calloc(data_chunks_num, sizeof(void *));
+		if (!stripe_req->partial_write.data_buffers) {
+			goto err;
+		}
+		for (i = 0; i < data_chunks_num; i++) {
+			stripe_req->partial_write.data_buffers[i] = spdk_dma_malloc(chunk_len,
+					r5_info->buf_alignment, NULL);
+			if (!stripe_req->partial_write.data_buffers[i]) {
+				goto err;
+			}
+		}
+
+		stripe_req->partial_write.parity_buf = spdk_dma_malloc(chunk_len, r5_info->buf_alignment, NULL);
+		if (!stripe_req->partial_write.parity_buf) {
+			goto err;
+		}
+
+		if (raid_io_md_size != 0) {
+			stripe_req->partial_write.md_buffers = calloc(data_chunks_num, sizeof(void *));
+			if (!stripe_req->partial_write.md_buffers) {
+				goto err;
+			}
+			for (i = 0; i < data_chunks_num; i++) {
+				stripe_req->partial_write.md_buffers[i] = spdk_dma_malloc(
+						raid_bdev->strip_size * raid_io_md_size, r5_info->buf_alignment, NULL);
+				if (!stripe_req->partial_write.md_buffers[i]) {
+					goto err;
+				}
+			}
+			stripe_req->partial_write.parity_md_buf = spdk_dma_malloc(
+					raid_bdev->strip_size * raid_io_md_size, r5_info->buf_alignment, NULL);
+			if (!stripe_req->partial_write.parity_md_buf) {
+				goto err;
+			}
+		}
 	} else {
 		assert(false);
 		return NULL;
@@ -1221,6 +1596,11 @@ raid5_ioch_destroy(void *io_device, void *ctx_buf)
 		raid5_stripe_request_free(stripe_req);
 	}
 
+	while ((stripe_req = TAILQ_FIRST(&r5ch->free_stripe_requests.partial_write))) {
+		TAILQ_REMOVE(&r5ch->free_stripe_requests.partial_write, stripe_req, link);
+		raid5_stripe_request_free(stripe_req);
+	}
+
 	if (r5ch->accel_ch) {
 		spdk_put_io_channel(r5ch->accel_ch);
 	}
@@ -1242,6 +1622,7 @@ raid5_ioch_create(void *io_device, void *ctx_buf)
 	TAILQ_INIT(&r5ch->free_stripe_requests.write);
 	TAILQ_INIT(&r5ch->free_stripe_requests.reconstruct);
 	TAILQ_INIT(&r5ch->free_stripe_requests.small_write);
+	TAILQ_INIT(&r5ch->free_stripe_requests.partial_write);
 	TAILQ_INIT(&r5ch->xor_retry_queue);
 
 	for (i = 0; i < RAID5_MAX_STRIPES; i++) {
@@ -1269,6 +1650,15 @@ raid5_ioch_create(void *io_device, void *ctx_buf)
 		}
 
 		TAILQ_INSERT_HEAD(&r5ch->free_stripe_requests.small_write, stripe_req, link);
+	}
+
+	for (i = 0; i < RAID5_MAX_STRIPES; i++) {
+		stripe_req = raid5_stripe_request_alloc(r5ch, STRIPE_REQ_PARTIAL_WRITE);
+		if (!stripe_req) {
+			goto err;
+		}
+
+		TAILQ_INSERT_HEAD(&r5ch->free_stripe_requests.partial_write, stripe_req, link);
 	}
 
 	r5ch->accel_ch = spdk_accel_get_io_channel();

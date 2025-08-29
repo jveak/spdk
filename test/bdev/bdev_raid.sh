@@ -948,6 +948,47 @@ function raid_resize_data_offset_test() {
 	return 0
 }
 
+function raid5f_partial_write_test() {
+	local raid_level="raid5f"
+	local num_base_bdevs=3
+	local strip_size_kb=64
+	local nbd=/dev/nbd0
+	local raid_bdev
+
+	$rootdir/test/app/bdev_svc/bdev_svc -i 0 -L bdev_raid &
+	raid_pid=$!
+	waitforlisten $raid_pid
+
+	for ((i = 0; i < num_base_bdevs; i++)); do
+		$rpc_py bdev_malloc_create 32 512 -b Base_$i
+	done
+
+	$rpc_py bdev_raid_create -z $strip_size_kb -r $raid_level -b "'Base_0 Base_1 Base_2'" -n raid5_pw
+
+	raid_bdev=$($rpc_py bdev_raid_get_bdevs online | jq -r '.[0]["name"] | select(.)')
+	if [ "$raid_bdev" != "raid5_pw" ]; then
+		echo "No raid5f device in SPDK app"
+		killprocess $raid_pid
+		return 1
+	fi
+
+	nbd_start_disks $DEFAULT_RPC_ADDR $raid_bdev $nbd
+
+	# Partial write of 96KB (1.5 chunks)
+	local write_size_kb=96
+	local write_size_bytes=$((write_size_kb * 1024))
+
+	dd if=/dev/urandom of=$tmp_dir/data bs=$write_size_bytes count=1
+	dd if=$tmp_dir/data of=$nbd bs=$write_size_bytes count=1 oflag=direct
+	blockdev --flushbufs $nbd
+
+	dd if=$nbd of=$tmp_dir/data_read bs=$write_size_bytes count=1 iflag=direct
+	cmp $tmp_dir/data $tmp_dir/data_read
+
+	nbd_stop_disks $DEFAULT_RPC_ADDR $nbd
+	killprocess $raid_pid
+}
+
 mkdir -p "$tmp_dir"
 trap 'cleanup; exit 1' EXIT
 
@@ -1017,6 +1058,10 @@ base_malloc_params="-m 32 -i"
 run_test "raid_state_function_test_sb_md_interleaved" raid_state_function_test raid1 2 true
 run_test "raid_superblock_test_md_interleaved" raid_superblock_test raid1 2
 run_test "raid_rebuild_test_sb_md_interleaved" raid_rebuild_test raid1 2 true false false
+
+if [ "$has_nbd" = true ]; then
+	run_test "raid5f_partial_write_test" raid5f_partial_write_test
+fi
 
 trap - EXIT
 cleanup

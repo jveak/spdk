@@ -241,3 +241,34 @@ spdk_copy_buf_to_iovs(struct iovec *iovs, int iovcnt, void *buf, size_t buf_len)
 	spdk_iov_xfer_init(&ix, iovs, iovcnt);
 	spdk_iov_xfer_from_buf(&ix, buf, buf_len);
 }
+
+size_t
+spdk_iov_cpy_to_buf(void *dst, size_t len, struct iovec *iovs, int iovcnt, size_t iov_offset)
+{
+	size_t total_len = 0;
+	int i = 0;
+	size_t copy_len;
+
+	while (i < iovcnt && iov_offset >= iovs[i].iov_len) {
+		iov_offset -= iovs[i].iov_len;
+		i++;
+	}
+
+	if (i == iovcnt) {
+		return 0;
+	}
+
+	copy_len = spdk_min(len, iovs[i].iov_len - iov_offset);
+	memcpy(dst, (char *)iovs[i].iov_base + iov_offset, copy_len);
+	total_len += copy_len;
+	i++;
+
+	while (total_len < len && i < iovcnt) {
+		copy_len = spdk_min(len - total_len, iovs[i].iov_len);
+		memcpy((char *)dst + total_len, iovs[i].iov_base, copy_len);
+		total_len += copy_len;
+		i++;
+	}
+
+	return total_len;
+}
