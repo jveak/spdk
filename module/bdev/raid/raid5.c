@@ -475,9 +475,15 @@ raid5_chunk_submit(struct chunk *chunk)
 			return 0;
 		}
 
-		ret = raid_bdev_writev_blocks_ext(base_info, base_ch, chunk->iovs, chunk->iovcnt,
-						  base_offset_blocks, raid_bdev->strip_size,
-						  raid5_chunk_complete_bdev_io, chunk, &io_opts);
+		if (chunk == stripe_req->parity_chunk) {
+			ret = raid_bdev_writev_blocks_ext_parity(base_info, base_ch, chunk->iovs, chunk->iovcnt,
+					base_offset_blocks, raid_bdev->strip_size,
+					raid5_chunk_complete_bdev_io, chunk, &io_opts);
+		} else {
+			ret = raid_bdev_writev_blocks_ext(base_info, base_ch, chunk->iovs, chunk->iovcnt,
+					base_offset_blocks, raid_bdev->strip_size,
+					raid5_chunk_complete_bdev_io, chunk, &io_opts);
+		}
 		break;
 	case STRIPE_REQ_RECONSTRUCT:
 		if (chunk == stripe_req->reconstruct.chunk) {
@@ -901,7 +907,7 @@ raid5_submit_small_write_request(struct raid_bdev_io *raid_io, uint64_t stripe_i
 	parity_iov.iov_len = raid_io->num_blocks * raid_bdev->bdev.blocklen;
 
 	raid5_init_ext_io_opts(&io_opts, raid_io);
-	ret = raid_bdev_readv_blocks_ext(parity_base_info, parity_ch, &parity_iov, 1,
+	ret = raid_bdev_readv_blocks_ext_parity(parity_base_info, parity_ch, &parity_iov, 1,
 					 base_offset_blocks, raid_io->num_blocks,
 					 raid5_small_write_read_complete, stripe_req, &io_opts);
 	if (ret) {
@@ -1010,7 +1016,7 @@ raid5_small_write_xor_complete(void *cb_arg, int status)
 	parity_iov.iov_len = raid_io->num_blocks * raid_bdev->bdev.blocklen;
 
 	raid5_init_ext_io_opts(&io_opts, raid_io);
-	ret = raid_bdev_writev_blocks_ext(parity_base_info, parity_ch, &parity_iov, 1,
+	ret = raid_bdev_writev_blocks_ext_parity(parity_base_info, parity_ch, &parity_iov, 1,
 					  base_offset_blocks, raid_io->num_blocks,
 					  raid5_small_write_write_complete, stripe_req, &io_opts);
 	if (ret) {
@@ -1140,7 +1146,7 @@ raid5_partial_write_xor_done(struct stripe_request *stripe_req, int status)
 	parity_iov.iov_len = strip_size * raid_bdev->bdev.blocklen;
 
 	raid_io->base_bdev_io_remaining++;
-	ret = raid_bdev_writev_blocks_ext(parity_base_info, parity_ch, &parity_iov, 1,
+	ret = raid_bdev_writev_blocks_ext_parity(parity_base_info, parity_ch, &parity_iov, 1,
 					  stripe_req->stripe_index << r5_info->raid_bdev->strip_size_shift,
 					  strip_size, raid5_partial_write_write_complete, stripe_req, NULL);
 	if (ret != 0) {
