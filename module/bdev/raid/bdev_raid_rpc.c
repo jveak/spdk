@@ -129,6 +129,9 @@ struct rpc_bdev_raid_create {
 	/* RAID raid level */
 	enum raid_level                      level;
 
+	/* Number of threads for IO processing */
+	uint32_t                             thread_count;
+
 	/* Base bdevs information */
 	struct rpc_bdev_raid_create_base_bdevs base_bdevs;
 
@@ -181,6 +184,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_create_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_raid_create, name), spdk_json_decode_string},
 	{"strip_size_kb", offsetof(struct rpc_bdev_raid_create, strip_size_kb), spdk_json_decode_uint32, true},
 	{"raid_level", offsetof(struct rpc_bdev_raid_create, level), decode_raid_level},
+	{"thread_count", offsetof(struct rpc_bdev_raid_create, thread_count), spdk_json_decode_uint32, true},
 	{"base_bdevs", offsetof(struct rpc_bdev_raid_create, base_bdevs), decode_base_bdevs},
 	{"uuid", offsetof(struct rpc_bdev_raid_create, uuid), spdk_json_decode_uuid, true},
 	{"superblock", offsetof(struct rpc_bdev_raid_create, superblock_enabled), spdk_json_decode_bool, true},
@@ -288,7 +292,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
 	}
 
 	rc = raid_bdev_create(req->name, req->strip_size_kb, num_base_bdevs,
-			      req->level, req->superblock_enabled, &req->uuid, &raid_bdev);
+			      req->level, req->superblock_enabled, &req->uuid, req->thread_count, &raid_bdev);
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc,
 						     "Failed to create RAID bdev %s: %s",
