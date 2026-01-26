@@ -1511,7 +1511,7 @@ raid_bdev_init(void)
 static int
 _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		  enum raid_level level, bool superblock_enabled, const struct spdk_uuid *uuid,
-		  struct raid_bdev **raid_bdev_out)
+		  uint32_t thread_count, struct raid_bdev **raid_bdev_out)
 {
 	struct raid_bdev *raid_bdev;
 	struct spdk_bdev *raid_bdev_gen;
@@ -1610,6 +1610,7 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	raid_bdev->level = level;
 	raid_bdev->min_base_bdevs_operational = min_operational;
 	raid_bdev->superblock_enabled = superblock_enabled;
+	raid_bdev->thread_count = thread_count;
 
 	raid_bdev_gen = &raid_bdev->bdev;
 
@@ -1652,7 +1653,7 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 int
 raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		 enum raid_level level, bool superblock_enabled, const struct spdk_uuid *uuid,
-		 struct raid_bdev **raid_bdev_out)
+		 uint32_t thread_count, struct raid_bdev **raid_bdev_out)
 {
 	struct raid_bdev *raid_bdev;
 	int rc;
@@ -1660,7 +1661,7 @@ raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 	assert(uuid != NULL);
 
 	rc = _raid_bdev_create(name, strip_size, num_base_bdevs, level, superblock_enabled, uuid,
-			       &raid_bdev);
+			       thread_count, &raid_bdev);
 	if (rc != 0) {
 		return rc;
 	}
@@ -3561,7 +3562,7 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
 	int rc;
 
 	rc = _raid_bdev_create(sb->name, (sb->strip_size * sb->block_size) / 1024, sb->num_base_bdevs,
-			       sb->level, true, &sb->uuid, &raid_bdev);
+			       sb->level, true, &sb->uuid, 0, &raid_bdev);
 	if (rc != 0) {
 		return rc;
 	}

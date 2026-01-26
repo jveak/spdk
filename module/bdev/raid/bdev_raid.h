@@ -158,6 +158,12 @@ struct raid_bdev_io {
 		struct iovec		*iov;
 		struct iovec		iov_copy;
 	} split;
+
+	/* Thread that the IO was submitted on */
+	struct spdk_thread		*submitted_thread;
+
+	/* IO status to be used when completing the IO on the original thread */
+	enum spdk_bdev_io_status	completion_status;
 };
 
 struct raid_bdev_process_request {
@@ -248,6 +254,9 @@ struct raid_bdev {
 	/* Callback and context for raid_bdev configuration */
 	raid_bdev_configure_cb		configure_cb;
 	void				*configure_cb_ctx;
+
+	/* Number of threads for IO distribution */
+	uint32_t			thread_count;
 };
 
 #define RAID_FOR_EACH_BASE_BDEV(r, i) \
@@ -264,7 +273,7 @@ typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 
 int raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		     enum raid_level level, bool superblock, const struct spdk_uuid *uuid,
-		     struct raid_bdev **raid_bdev_out);
+		     uint32_t thread_count, struct raid_bdev **raid_bdev_out);
 void raid_bdev_delete(struct raid_bdev *raid_bdev, raid_bdev_destruct_cb cb_fn, void *cb_ctx);
 int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 			    raid_base_bdev_cb cb_fn, void *cb_ctx);

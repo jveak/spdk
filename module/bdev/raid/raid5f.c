@@ -115,6 +115,11 @@ struct raid5f_info {
 
 	/* block length bit shift for optimized calculation, only valid when no interleaved md */
 	uint32_t blocklen_shift;
+
+	/* Thread management information */
+	uint32_t thread_count;
+	struct spdk_thread **threads;
+	uint32_t *cpu_cores;
 };
 
 struct raid5f_io_channel {
@@ -609,7 +614,7 @@ raid5f_stripe_write_request_xor_done(struct stripe_request *stripe_req, int stat
 
 	if (status != 0) {
 		raid5f_stripe_request_release(stripe_req);
-		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		raid5f_complete_io_to_submitted_thread(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
 	} else {
 		raid5f_stripe_request_submit_chunks(stripe_req);
 	}
@@ -656,7 +661,7 @@ raid5f_chunk_read_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_
 
 	spdk_bdev_free_io(bdev_io);
 
-	raid_bdev_io_complete(raid_io, success ? SPDK_BDEV_IO_STATUS_SUCCESS :
+	raid5f_complete_io_to_submitted_thread(raid_io, success ? SPDK_BDEV_IO_STATUS_SUCCESS :
 			      SPDK_BDEV_IO_STATUS_FAILED);
 }
 
@@ -671,13 +676,38 @@ _raid5f_submit_rw_request(void *_raid_io)
 }
 
 static void
+_raid5f_complete_io(void *ctx)
+{
+	struct raid_bdev_io *raid_io = ctx;
+	raid_bdev_io_complete(raid_io, raid_io->completion_status);
+}
+
+static void
+raid5f_complete_io_to_submitted_thread(struct raid_bdev_io *raid_io,
+                                       enum spdk_bdev_io_status status)
+{
+	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid5f_info *r5f_info = raid_bdev->module_private;
+	struct spdk_thread *submitted_thread = raid_io->submitted_thread;
+	struct spdk_thread *current_thread = spdk_get_thread();
+
+	raid_io->completion_status = status;
+
+	if (r5f_info->thread_count > 0 && submitted_thread != current_thread) {
+		spdk_thread_send_msg(submitted_thread, _raid5f_complete_io, raid_io);
+	} else {
+		raid_bdev_io_complete(raid_io, status);
+	}
+}
+
+static void
 raid5f_stripe_request_reconstruct_xor_done(struct stripe_request *stripe_req, int status)
 {
 	struct raid_bdev_io *raid_io = stripe_req->raid_io;
 
 	raid5f_stripe_request_release(stripe_req);
 
-	raid_bdev_io_complete(raid_io,
+	raid5f_complete_io_to_submitted_thread(raid_io,
 			      status == 0 ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
 }
 
@@ -803,6 +833,19 @@ raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 	uint64_t stripe_index = raid_io->offset_blocks / r5f_info->stripe_blocks;
 	uint64_t stripe_offset = raid_io->offset_blocks % r5f_info->stripe_blocks;
 	int ret;
+
+	if (r5f_info->thread_count > 0) {
+		uint32_t target_thread_index = stripe_index % r5f_info->thread_count;
+		struct spdk_thread *current_thread = spdk_get_thread();
+		struct spdk_thread *target_thread = r5f_info->threads[target_thread_index];
+
+		raid_io->submitted_thread = current_thread;
+
+		if (current_thread != target_thread) {
+			spdk_thread_send_msg(target_thread, _raid5f_submit_rw_request, raid_io);
+			return;
+		}
+	}
 
 	switch (raid_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
@@ -994,6 +1037,70 @@ raid5f_ioch_destroy(void *io_device, void *ctx_buf)
 	free(r5ch->chunk_xor_iovcnt);
 }
 
+static void
+raid5f_cleanup_threads(struct raid_bdev *raid_bdev)
+{
+	struct raid5f_info *r5f_info = raid_bdev->module_private;
+	uint32_t i;
+
+	if (r5f_info->threads == NULL) {
+		return;
+	}
+
+	for (i = 0; i < r5f_info->thread_count; i++) {
+		if (r5f_info->threads[i]) {
+			spdk_thread_destroy(r5f_info->threads[i]);
+		}
+	}
+
+	free(r5f_info->threads);
+	free(r5f_info->cpu_cores);
+	r5f_info->threads = NULL;
+	r5f_info->cpu_cores = NULL;
+	r5f_info->thread_count = 0;
+}
+
+static int
+raid5f_init_threads(struct raid_bdev *raid_bdev, uint32_t thread_count)
+{
+	struct raid5f_info *r5f_info = raid_bdev->module_private;
+	uint32_t i;
+	struct spdk_cpuset *cpuset;
+
+	r5f_info->thread_count = thread_count;
+	r5f_info->threads = calloc(thread_count, sizeof(struct spdk_thread *));
+	r5f_info->cpu_cores = calloc(thread_count, sizeof(uint32_t));
+
+	if (!r5f_info->threads || !r5f_info->cpu_cores) {
+		raid5f_cleanup_threads(raid_bdev);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < thread_count; i++) {
+		char thread_name[64];
+		snprintf(thread_name, sizeof(thread_name), "raid5f_%s_%u", raid_bdev->bdev.name, i);
+
+		cpuset = spdk_cpuset_alloc();
+		if (!cpuset) {
+			raid5f_cleanup_threads(raid_bdev);
+			return -ENOMEM;
+		}
+
+		r5f_info->cpu_cores[i] = i;
+		spdk_cpuset_set_cpu(cpuset, i, true);
+
+		r5f_info->threads[i] = spdk_thread_create(thread_name, cpuset);
+		if (!r5f_info->threads[i]) {
+			spdk_cpuset_free(cpuset);
+			raid5f_cleanup_threads(raid_bdev);
+			return -ENOMEM;
+		}
+		spdk_cpuset_free(cpuset);
+	}
+
+	return 0;
+}
+
 static int
 raid5f_ioch_create(void *io_device, void *ctx_buf)
 {
@@ -1094,6 +1201,13 @@ raid5f_start(struct raid_bdev *raid_bdev)
 
 	raid_bdev->module_private = r5f_info;
 
+	if (raid_bdev->thread_count > 0) {
+		if (raid5f_init_threads(raid_bdev, raid_bdev->thread_count) != 0) {
+			free(r5f_info);
+			return -1;
+		}
+	}
+
 	spdk_io_device_register(r5f_info, raid5f_ioch_create, raid5f_ioch_destroy,
 				sizeof(struct raid5f_io_channel), NULL);
 
@@ -1110,10 +1224,14 @@ raid5f_io_device_unregister_done(void *io_device)
 	free(r5f_info);
 }
 
+static void raid5f_cleanup_threads(struct raid_bdev *raid_bdev);
+
 static bool
 raid5f_stop(struct raid_bdev *raid_bdev)
 {
 	struct raid5f_info *r5f_info = raid_bdev->module_private;
+
+	raid5f_cleanup_threads(raid_bdev);
 
 	spdk_io_device_unregister(r5f_info, raid5f_io_device_unregister_done);
 
